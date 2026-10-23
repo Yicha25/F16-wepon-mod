@@ -2,6 +2,9 @@
 add AIM-9X and bullet into GeoFS default F16
 
 # Keybind
+
+"u" -> Toggle on/off
+
 " \ " -> Shoot
 
 "-" / "="  -> Switch wepon
@@ -12,3 +15,7 @@ add AIM-9X and bullet into GeoFS default F16
 
 "Shift + u" -> Refill current wepon
 
+
+# Menu
+
+Menu page can be find in "Option -> General" 
