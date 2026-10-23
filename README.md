@@ -2,7 +2,7 @@
 add AIM-9X and bullet into GeoFS default F16
 
 # Keybind
-"\" -> Shoot
+" \ " -> Shoot
 
 "-" / "="  -> Switch wepon
 
