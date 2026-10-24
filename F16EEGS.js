@@ -47,8 +47,7 @@
   const LOADOUT_STORAGE_KEY = 'geofs-eegs-loadout';
   const AA_HUD_POI_STORAGE_KEY = 'geofs-eegs-aa-hud-poi';
   const MP_SYNC_STORAGE_KEY = 'geofs-eegs-mp-sync';
-  const MP_SYNC_PREFIX = 'F16EEGS1|';
-  const MP_SYNC_CHAT_PREFIX = 'F16E:';
+  const MP_SYNC_CHAT_PREFIX = 'F7|';
   const MISSILE_LIMITS = { 'AIM-9X': 4, 'AIM-120D': 6, 'AGM-65': 6 };
   const DEFAULT_MISSILE_LOADOUT = { 'AIM-9X': 4, 'AIM-120D': 6, 'AGM-65': 0 };
   const MAX_MISSILE_LOADOUT = 16;
@@ -83,12 +82,12 @@
   let npcCountermeasures = [];
   let npcCountermeasureSequence = 0;
   const multiplayerSync = { enabled: false, group: '', sharedHits: 0 };
-  let multiplayerHookRef = null;
   let originalMultiplayerUpdate = null;
   let wrappedMultiplayerUpdate = null;
   let networkMissileSequence = 0;
   let networkMissiles = [];
   const receivedNetworkEvents = new Set();
+  const seenMultiplayerChatMessages = new Set();
   let lastPos = null, lastT = 0, prevAxes = null;
   const vel = [0, 0, 0];
   const omega = [0, 0, 0];
@@ -776,7 +775,7 @@
             multiplayerSync.sharedHits++;
             impacts.push({ pos: Cesium.Cartesian3.clone(ownWorld), t0: now });
             toast = {
-              text: 'SIMULATED MISSILE HIT FROM ' + String(missile.senderId).slice(0, 20),
+              text: 'MISSILE HIT FROM ' + getMultiplayerUserLabel(missile.senderId),
               until: now + 3500,
             };
           }
@@ -1037,7 +1036,8 @@
 
   function renderGeoFsOptionsMultiplayer() {
     const container = document.querySelector('.f16eegs-mp-controls');
-    if (!container || container.childElementCount) return;
+    if (!container) return;
+    container.replaceChildren();
     const label = document.createElement('label');
     Object.assign(label.style, {
       display: 'flex',
@@ -1053,155 +1053,325 @@
       multiplayerSync.enabled = enabledInput.checked;
       saveMultiplayerSyncSettings();
       if (!multiplayerSync.enabled) networkMissiles = [];
-      if (multiplayerSync.enabled && !multiplayerSync.group) {
-        toast = { text: 'SET A MULTIPLAYER GROUP CODE FIRST', until: performance.now() + 2500 };
-      } else {
-        toast = {
-          text: 'MULTIPLAYER MISSILE SYNC ' + (multiplayerSync.enabled ? 'ON' : 'OFF'),
-          until: performance.now() + 2000,
-        };
-      }
-      renderGeoFsOptionsCombat();
+      toast = {
+        text: 'MULTIPLAYER MISSILE SYNC ' + (multiplayerSync.enabled ? 'ON' : 'OFF'),
+        until: performance.now() + 2000,
+      };
     });
     label.append(enabledInput, document.createTextNode('Enable multiplayer missile sync'));
 
     const groupLabel = document.createElement('label');
     Object.assign(groupLabel.style, { display: 'flex', alignItems: 'center', gap: '8px' });
-    groupLabel.appendChild(document.createTextNode('Group code'));
+    groupLabel.appendChild(document.createTextNode('Sync group code'));
     const groupInput = document.createElement('input');
     groupInput.type = 'text';
     groupInput.value = multiplayerSync.group;
     groupInput.maxLength = 16;
     groupInput.autocomplete = 'off';
     groupInput.spellcheck = false;
-    groupInput.placeholder = 'same code for both players';
+    groupInput.placeholder = 'share the same 16-character code';
     groupInput.setAttribute('aria-label', 'Multiplayer missile sync group code');
-    groupInput.addEventListener('input', () => {
+    groupInput.addEventListener('change', () => {
       const value = groupInput.value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
       if (groupInput.value !== value) groupInput.value = value;
       multiplayerSync.group = value;
       saveMultiplayerSyncSettings();
-      renderGeoFsOptionsCombat();
     });
     groupLabel.appendChild(groupInput);
+
+    const generateKeyButton = document.createElement('button');
+    generateKeyButton.type = 'button';
+    generateKeyButton.textContent = 'Generate Group Code';
+    generateKeyButton.addEventListener('click', () => {
+      multiplayerSync.group = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      groupInput.value = multiplayerSync.group;
+      saveMultiplayerSyncSettings();
+    });
 
     const testButton = document.createElement('button');
     testButton.type = 'button';
     testButton.textContent = 'Send Sync Test';
-    testButton.addEventListener('click', () => {
+    testButton.addEventListener('click', async () => {
       if (!multiplayerSync.enabled) {
         toast = { text: 'ENABLE MULTIPLAYER SYNC FIRST', until: performance.now() + 2500 };
         return;
       }
-      if (!multiplayerSync.group) {
-        toast = { text: 'SET A MULTIPLAYER GROUP CODE FIRST', until: performance.now() + 2500 };
+      if (multiplayerSync.group.length < 16) {
+        toast = { text: 'SET A 16-CHARACTER SYNC GROUP CODE', until: performance.now() + 2500 };
         return;
       }
-      if (sendMultiplayerSyncEvent([1, 'T', Date.now()])) {
-        toast = { text: 'SYNC TEST SENT; CHECK PUBLIC CHAT', until: performance.now() + 3000 };
+      if (await sendMultiplayerSyncEvent([1, 'T', Date.now()])) {
+        toast = { text: 'SYNC TEST SENT IN PUBLIC GEOFS CHAT', until: performance.now() + 3000 };
       }
     });
 
     const note = document.createElement('p');
     note.style.margin = '6px 0';
-    note.textContent = 'Both players need this addon, sync enabled, and the same code. Events are Base64-encoded in public chat, but are not private and can be decoded by anyone.';
-    container.append(label, groupLabel, testButton, note);
+    note.textContent = 'Both players need the same 16-character group code and updated addon. Sync messages are plain text in public GeoFS chat; anyone can read them. A short group fingerprint filters which messages this addon processes.';
+    container.append(label, groupLabel, generateKeyButton, testButton, note);
   }
 
-  function getMultiplayerSelfId(payload) {
-    const multiplayer = window.multiplayer;
-    return String(multiplayer?.myId ?? multiplayer?.lastResponse?.myId ?? payload?.myId ?? '');
-  }
-
-  function decodeMultiplayerChatText(value) {
-    const text = String(value ?? '');
-    try {
-      return decodeURIComponent(text);
-    } catch (error) {
-      return text;
-    }
-  }
-
-  function encodeMultiplayerSyncText(value) {
-    const bytes = new TextEncoder().encode(value);
-    let binary = '';
-    for (const byte of bytes) binary += String.fromCharCode(byte);
-    return btoa(binary);
-  }
-
-  function decodeMultiplayerSyncText(value) {
-    try {
-      const binary = atob(value);
-      const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function sendMultiplayerSyncEvent(eventData) {
-    if (!multiplayerSync.enabled || !multiplayerSync.group) return false;
+  async function sendMultiplayerSyncEvent(eventData) {
+    if (!multiplayerSync.enabled || multiplayerSync.group.length < 16) return false;
     const multiplayer = window.multiplayer;
     if (typeof multiplayer?.setChatMessage !== 'function') {
       toast = { text: 'GEOFS CHAT SYNC API UNAVAILABLE', until: performance.now() + 2500 };
       return false;
     }
-    const payload = MP_SYNC_PREFIX + multiplayerSync.group + '|'
-      + JSON.stringify(eventData);
-    const message = MP_SYNC_CHAT_PREFIX + encodeMultiplayerSyncText(payload);
-    if (message.length > 220) {
-      toast = { text: 'MULTIPLAYER EVENT TOO LONG TO SEND', until: performance.now() + 2500 };
-      return false;
-    }
     try {
+      const message = encodeMultiplayerSyncChatEvent(eventData);
+      if (!message) return false;
+      if (message.length > 70) {
+        toast = { text: 'SYNC EVENT EXCEEDS GEOFS CHAT LIMIT', until: performance.now() + 2500 };
+        return false;
+      }
       multiplayer.setChatMessage(message);
       return true;
     } catch (error) {
-      toast = { text: 'MULTIPLAYER EVENT COULD NOT BE SENT', until: performance.now() + 2500 };
+      toast = {
+        text: error.message || 'MULTIPLAYER EVENT COULD NOT BE SENT',
+        until: performance.now() + 3000,
+      };
       return false;
     }
   }
 
-  function processMultiplayerSyncChat(message, payload) {
-    if (!multiplayerSync.enabled || !multiplayerSync.group) return;
-    const senderId = String(message?.uid ?? '');
-    const selfId = getMultiplayerSelfId(payload);
-    if (!senderId || (selfId && senderId === selfId)) return;
-    let text = decodeMultiplayerChatText(message?.msg);
-    if (text.startsWith(MP_SYNC_CHAT_PREFIX)) {
-      text = decodeMultiplayerSyncText(text.slice(MP_SYNC_CHAT_PREFIX.length));
-      if (text === null) return;
+  function encodeMultiplayerSyncChatEvent(eventData) {
+    if (!Array.isArray(eventData)) return '';
+    const prefix = MP_SYNC_CHAT_PREFIX + getMultiplayerSyncGroupFingerprint() + '|';
+    if (eventData[1] === 'T') {
+      return prefix + 'T|' + Date.now().toString(36);
     }
-    const prefix = MP_SYNC_PREFIX + multiplayerSync.group + '|';
-    if (!text.startsWith(prefix)) return;
+    if (eventData[1] === 'L' && eventData[0] === 3) {
+      const [, , missileId, targetId, sentAt] = eventData;
+      if (typeof missileId !== 'string' || typeof targetId !== 'string') return '';
+      const sentAtToken = typeof sentAt === 'string'
+        ? sentAt
+        : Number(sentAt).toString(36);
+      if (!/^[0-9a-z]+$/i.test(sentAtToken)) return '';
+      return prefix + [
+        'L',
+        encodeURIComponent(missileId),
+        encodeURIComponent(targetId),
+        sentAtToken,
+      ].join('|');
+    }
+    if ((eventData[1] === 'H' || eventData[1] === 'X') && eventData.length === 5) {
+      const [, type, missileId, targetId, sentAt] = eventData;
+      if (typeof missileId !== 'string' || typeof targetId !== 'string'
+        || !Number.isFinite(sentAt)) return '';
+      return prefix + [
+        type,
+        encodeURIComponent(missileId),
+        encodeURIComponent(targetId),
+        sentAt.toString(36),
+      ].join('|');
+    }
+    return '';
+  }
 
-    let data;
-    try {
-      data = JSON.parse(text.slice(prefix.length));
-    } catch (error) {
-      return;
+  function getMultiplayerSyncGroupFingerprint() {
+    let hash = 2166136261;
+    for (let i = 0; i < multiplayerSync.group.length; i++) {
+      hash ^= multiplayerSync.group.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
     }
-    if (!Array.isArray(data) || data[0] !== 1) return;
+    return (hash >>> 0).toString(36);
+  }
+
+  function parseMultiplayerSyncChatEvent(value) {
+    const fields = value.split('|');
+    const type = fields[0];
+    if (type === 'T' && fields.length === 2) {
+      const sentAt = Number.parseInt(fields[1], 36);
+      return Number.isFinite(sentAt) ? [1, 'T', sentAt] : null;
+    }
+    if (type === 'L' && fields.length === 4) {
+      const sentAt = Number.parseInt(fields[3], 36);
+      if (!Number.isFinite(sentAt)) return null;
+      return [
+        3,
+        'L',
+        decodeURIComponent(fields[1]),
+        decodeURIComponent(fields[2]),
+        sentAt,
+      ];
+    }
+    if ((type === 'H' || type === 'X') && fields.length === 4) {
+      const sentAt = Number.parseInt(fields[3], 36);
+      if (!Number.isFinite(sentAt)) return null;
+      return [
+        1,
+        type,
+        decodeURIComponent(fields[1]),
+        decodeURIComponent(fields[2]),
+        sentAt,
+      ];
+    }
+    return null;
+  }
+
+  function getMultiplayerUser(userId) {
+    const users = window.multiplayer?.visibleUsers;
+    if (!users || typeof users !== 'object') return null;
+    const id = String(userId);
+    for (const [key, user] of Object.entries(users)) {
+      if ([key, user?.id, user?.uid].some(value => value != null && String(value) === id)) {
+        return user;
+      }
+    }
+    return null;
+  }
+
+  function getMultiplayerUserLabel(userId) {
+    const user = getMultiplayerUser(userId);
+    const label = user?.callsign ?? user?.cs ?? user?.aircraftName ?? user?.username;
+    return label ? String(label).slice(0, 20) : 'PLAYER ' + String(userId).slice(0, 12);
+  }
+
+  function normalizeMultiplayerChatText(value) {
+    let text = String(value ?? '');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const decoded = decodeURIComponent(text.replace(/\+/g, '%20'));
+        if (decoded === text) break;
+        text = decoded;
+      } catch (error) {
+        break;
+      }
+    }
+    return text;
+  }
+
+  async function processMultiplayerSyncChat(message, payload) {
+    if (!multiplayerSync.enabled || multiplayerSync.group.length < 16) return;
+    const senderId = String(message?.uid ?? '');
+    const selfId = String(window.multiplayer?.myId
+      ?? window.multiplayer?.lastResponse?.myId ?? payload?.myId ?? '');
+    if (!senderId || (selfId && senderId === selfId)) return;
+
+    const chatText = normalizeMultiplayerChatText(message?.msg);
+    if (!chatText.startsWith(MP_SYNC_CHAT_PREFIX)) return;
+    const groupSeparator = chatText.indexOf('|', MP_SYNC_CHAT_PREFIX.length);
+    if (groupSeparator < 0) return;
+    const group = chatText.slice(MP_SYNC_CHAT_PREFIX.length, groupSeparator);
+    if (group !== getMultiplayerSyncGroupFingerprint()) return;
+    const messageKey = senderId + ':' + chatText;
+    if (seenMultiplayerChatMessages.has(messageKey)) return;
+    seenMultiplayerChatMessages.add(messageKey);
+    if (seenMultiplayerChatMessages.size > 500) {
+      seenMultiplayerChatMessages.delete(seenMultiplayerChatMessages.values().next().value);
+    }
+
+    try {
+      const data = parseMultiplayerSyncChatEvent(chatText.slice(groupSeparator + 1));
+      if (!data) throw new Error('Malformed sync event');
+      processMultiplayerSyncEvent(data, senderId, selfId);
+    } catch (error) {
+      toast = {
+        text: 'INVALID SYNC CHAT MESSAGE (' + chatText.length + ' CHARS)',
+        until: performance.now() + 3000,
+      };
+    }
+  }
+
+  async function onMultiplayerUpdate(payload) {
+    const messages = Array.isArray(payload?.chatMessages) ? payload.chatMessages : [];
+    for (const message of messages) await processMultiplayerSyncChat(message, payload);
+  }
+
+  function ensureMultiplayerSyncHook() {
+    const multiplayer = window.multiplayer;
+    if (!multiplayer || typeof multiplayer.updateCallback !== 'function') return false;
+    if (multiplayer.updateCallback === wrappedMultiplayerUpdate) return true;
+
+    originalMultiplayerUpdate = multiplayer.updateCallback;
+    wrappedMultiplayerUpdate = function (payload) {
+      void onMultiplayerUpdate(payload);
+      return originalMultiplayerUpdate.apply(this, arguments);
+    };
+    multiplayer.updateCallback = wrappedMultiplayerUpdate;
+    return true;
+  }
+
+  function processMultiplayerSyncEvent(data, senderId, selfIdOverride) {
+    if (!multiplayerSync.enabled || !Array.isArray(data)) return;
+    const selfId = selfIdOverride ?? String(window.multiplayer?.myId
+      ?? window.multiplayer?.lastResponse?.myId ?? '');
+    if (data[0] !== 1 && data[0] !== 2 && data[0] !== 3) return;
 
     if (data[1] === 'T') {
       toast = {
-        text: 'MULTIPLAYER SYNC TEST RECEIVED FROM ' + String(message?.cs || 'PLAYER').slice(0, 20),
+        text: 'MULTIPLAYER SYNC TEST RECEIVED',
         until: performance.now() + 3000,
       };
       return;
     }
 
     if (data[1] === 'L') {
-      const [, , missileId, targetId, position, velocity, speed, turnRate,
-        maxFlightTime, sentAt] = data;
+      if (data[0] === 3) {
+        const [, , missileId, targetId, sentAt] = data;
+        if (String(targetId) !== selfId || !selfId || typeof missileId !== 'string'
+          || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+        const key = senderId + ':' + missileId;
+        if (receivedNetworkEvents.has('L:' + key)) return;
+        const sender = getMultiplayerUser(senderId);
+        const coordinates = sender?.lastUpdate?.co;
+        const own = geofs.aircraft.instance?.llaLocation;
+        if (!Array.isArray(coordinates) || coordinates.length < 3
+          || !Array.isArray(own) || own.length < 3) return;
+        const [lat, lon, altitude] = coordinates.map(Number);
+        if (![lat, lon, altitude].every(Number.isFinite)) return;
+        const position = Cesium.Cartesian3.fromDegrees(lon, lat, altitude);
+        const targetPosition = Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]);
+        const direction = Cesium.Cartesian3.subtract(
+          targetPosition, position, new Cesium.Cartesian3());
+        const distance = Cesium.Cartesian3.magnitude(direction);
+        if (!Number.isFinite(distance) || distance <= 0) return;
+        Cesium.Cartesian3.normalize(direction, direction);
+        Cesium.Cartesian3.multiplyByScalar(direction, 900, direction);
+        receivedNetworkEvents.add('L:' + key);
+        if (receivedNetworkEvents.size > 500) {
+          receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+        }
+        networkMissiles.push({
+          key,
+          senderId,
+          missileId,
+          position,
+          lastTargetWorld: null,
+          velocity: [direction.x, direction.y, direction.z],
+          speed: 900,
+          turnRate: 1.2,
+          maxFlightTime: Math.min(240, Math.max(8, distance / 700 + 10)),
+          t0: performance.now(),
+          updatedAt: performance.now(),
+          trail: [],
+        });
+        if (networkMissiles.length > 32) networkMissiles.shift();
+        toast = {
+          text: 'MISSILE LAUNCHED BY ' + getMultiplayerUserLabel(senderId),
+          until: performance.now() + 2500,
+        };
+        return;
+      }
+      const compact = data[0] === 2;
+      const [, , missileId, targetId, rawPosition, rawVelocity, speedOrFlightTime,
+        turnRateOrSentAt, maxFlightTime, sentAt] = data;
+      const position = compact ? rawPosition?.map(value => value * 10) : rawPosition;
+      const velocity = compact ? rawVelocity?.map(value => value * 10) : rawVelocity;
+      const speed = compact ? 900 : speedOrFlightTime;
+      const turnRate = compact ? 1.2 : turnRateOrSentAt;
+      const compactSentAt = compact ? Number.parseInt(String(turnRateOrSentAt), 36) : sentAt;
+      const flightTime = compact ? speedOrFlightTime : maxFlightTime;
       if (String(targetId) !== selfId || !selfId || typeof missileId !== 'string'
         || !Array.isArray(position) || !Array.isArray(velocity)
         || position.length !== 3 || velocity.length !== 3
         || !position.every(Number.isFinite) || !velocity.every(Number.isFinite)
         || !Number.isFinite(speed) || speed < 200 || speed > 1500
         || !Number.isFinite(turnRate) || turnRate < 0.1 || turnRate > 3
-        || !Number.isFinite(maxFlightTime) || maxFlightTime < 1 || maxFlightTime > 240
-        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+        || !Number.isFinite(flightTime) || flightTime < 1 || flightTime > 240
+        || !Number.isFinite(compactSentAt) || Math.abs(Date.now() - compactSentAt) > 15000) return;
       const key = senderId + ':' + missileId;
       if (receivedNetworkEvents.has('L:' + key)) return;
       receivedNetworkEvents.add('L:' + key);
@@ -1217,14 +1387,14 @@
         velocity,
         speed,
         turnRate,
-        maxFlightTime,
+        maxFlightTime: flightTime,
         t0: performance.now(),
         updatedAt: performance.now(),
         trail: [],
       });
       if (networkMissiles.length > 32) networkMissiles.shift();
       toast = {
-        text: String(message?.cs || 'PLAYER').slice(0, 20) + ' LAUNCHED A MISSILE AT YOU',
+        text: 'MISSILE LAUNCHED BY ' + getMultiplayerUserLabel(senderId),
         until: performance.now() + 2500,
       };
       return;
@@ -1250,7 +1420,7 @@
         });
       }
       toast = {
-        text: 'MULTIPLAYER MISSILE HIT FROM ' + String(message?.cs || 'PLAYER').slice(0, 20),
+        text: 'MISSILE HIT FROM ' + getMultiplayerUserLabel(senderId),
         until: performance.now() + 3500,
       };
       return;
@@ -1263,25 +1433,6 @@
       const key = senderId + ':' + missileId;
       networkMissiles = networkMissiles.filter(missile => missile.key !== key);
     }
-  }
-
-  function onMultiplayerUpdate(payload) {
-    const messages = Array.isArray(payload?.chatMessages) ? payload.chatMessages : [];
-    for (const message of messages) processMultiplayerSyncChat(message, payload);
-  }
-
-  function ensureMultiplayerSyncHook() {
-    const multiplayer = window.multiplayer;
-    if (!multiplayer || typeof multiplayer.updateCallback !== 'function') return false;
-    if (multiplayer.updateCallback === wrappedMultiplayerUpdate) return true;
-    originalMultiplayerUpdate = multiplayer.updateCallback;
-    multiplayerHookRef = multiplayer;
-    wrappedMultiplayerUpdate = function (payload) {
-      onMultiplayerUpdate(payload);
-      return originalMultiplayerUpdate.apply(this, arguments);
-    };
-    multiplayer.updateCallback = wrappedMultiplayerUpdate;
-    return true;
   }
 
   function getRadarTargets() {
@@ -1898,32 +2049,24 @@
     missiles.push(missile);
     let networkSyncStatus = '';
     if (selectedTarget && !selectedTarget.isNpc && missile.networkId) {
-      const worldPosition = Cesium.Matrix4.multiplyByPoint(
-        origin,
-        new Cesium.Cartesian3(start[0], start[1], start[2]),
-        new Cesium.Cartesian3());
-      const worldVelocity = Cesium.Matrix4.multiplyByPointAsVector(
-        origin,
-        new Cesium.Cartesian3(velocity[0], velocity[1], velocity[2]),
-        new Cesium.Cartesian3());
       if (!multiplayerSync.enabled) {
         networkSyncStatus = 'MP SYNC OFF';
       } else if (!multiplayerSync.group) {
         networkSyncStatus = 'MP GROUP MISSING';
       } else {
-        const sent = sendMultiplayerSyncEvent([
-          1,
+        const event = [
+          3,
           'L',
           missile.networkId,
           selectedTarget.id,
-          [worldPosition.x, worldPosition.y, worldPosition.z].map(Math.round),
-          [worldVelocity.x, worldVelocity.y, worldVelocity.z].map(Math.round),
-          900,
-          1.2,
-          missile.maxFlightTime,
           Date.now(),
-        ]);
-        networkSyncStatus = sent ? 'MP EVENT SENT' : 'MP SEND FAILED';
+        ];
+        networkSyncStatus = 'MP EVENT SENDING';
+        void sendMultiplayerSyncEvent(event).then(sent => {
+          if (sent) {
+            toast = { text: 'MISSILE EVENT SENT IN PUBLIC CHAT', until: performance.now() + 2500 };
+          }
+        });
       }
     }
     missileAmmo[weapon]--;
@@ -2070,7 +2213,7 @@
       if (t > missile.maxFlightTime) {
         if (missile.networkId && !missile.networkTerminalSent) {
           missile.networkTerminalSent = true;
-          sendMultiplayerSyncEvent([
+          void sendMultiplayerSyncEvent([
             1,
             'X',
             missile.networkId,
@@ -2121,7 +2264,7 @@
           } else if (missile.networkId && !missile.networkHitSent) {
             missile.networkHitSent = true;
             missile.networkTerminalSent = true;
-            sendMultiplayerSyncEvent([
+            void sendMultiplayerSyncEvent([
               1,
               'H',
               missile.networkId,
@@ -2155,7 +2298,7 @@
       if (hit) {
         if (missile.networkId && !missile.networkTerminalSent) {
           missile.networkTerminalSent = true;
-          sendMultiplayerSyncEvent([
+          void sendMultiplayerSyncEvent([
             1,
             'X',
             missile.networkId,
@@ -2414,7 +2557,7 @@
         lockedTargetId = null;
       }
       toast = {
-        text: targetMode ? 'TARGET MODE ON' : 'TARGET MODE OFF',
+        text: targetMode ? 'RADAR ON' : 'RADAR OFF',
         until: performance.now() + 1500,
       };
       return;
@@ -2487,7 +2630,7 @@
       if (e.shiftKey) {
         if (weaponIndex === 0) {
           ammo = CFG.ammo;
-          toast = { text: 'GUN reloaded: ' + ammo, until: performance.now() + 2000 };
+          toast = { text: 'wepon reloaded: ' + ammo, until: performance.now() + 2000 };
         } else {
           const weapon = WEAPONS[weaponIndex];
           missileAmmo[weapon] = configuredMissiles[weapon];
@@ -2509,6 +2652,10 @@
   loadConfiguredMissiles();
   loadAABanditHudPoiSetting();
   loadMultiplayerSyncSettings();
+  ensureMultiplayerSyncHook();
+  setInterval(() => {
+    ensureMultiplayerSyncHook();
+  }, 1000);
 
   const boot = setInterval(function () {
     if (document.body) watchGeoFsOptionsLoadout();
@@ -2517,11 +2664,6 @@
       clearInterval(boot);
       createCanvas();
       requestAnimationFrame(frame);
-      if (!ensureMultiplayerSyncHook()) {
-        const syncHookRetry = setInterval(function () {
-          if (ensureMultiplayerSyncHook()) clearInterval(syncHookRetry);
-        }, 1000);
-      }
       toast = { text: 'EEGS loaded (' + CFG.toggleKey.toUpperCase() + ' to toggle, have fun I guess)', until: performance.now() + 3000 };
     }
   }, 500);
