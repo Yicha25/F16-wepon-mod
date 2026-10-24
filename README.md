@@ -1,22 +1,22 @@
 # F16-wepon-mod
 
-add AIM-9X and bullet into GeoFS default F16
+add AIM-9X and bullet into GeoFS default F16.
 
-Yes this also work in 4.0
+Yes this also work in 4.0.
 
 # Keybind
 
-"u" -> Toggle on/off
+"u" -> Toggle on/off.
 
-" \ " -> Shoot
+" \ " -> Shoot.
 
-"-" / "="  -> Switch wepon
+"-" / "="  -> Switch wepon.
 
-"," / "/" -> Next target
+"," / "/" -> Next target.
 
-"t" -> Radar toggle
+"t" -> Radar toggle.
 
-"Shift + u" -> Refill current wepon
+"Shift + u" -> Refill current wepon.
 
 
 # Menu
@@ -28,6 +28,8 @@ Menu page can be find in "Option -> General"
 Multiplayer sync lets two players using this add-on see a simplified incoming missile and receive hit notifications. It uses GeoFS's **public chat** to carry short sync messages; it does not create a private room or hide messages from other players.
 
 ### Connect two players
+
+Its important that you ***MUST*** have GeoFS Account.
 
 1. Both players should load the same, current `F16EEGS.js` version and join the same GeoFS multiplayer session.
 
