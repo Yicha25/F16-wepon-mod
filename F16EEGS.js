@@ -46,6 +46,9 @@
   const RADAR_RANGE_NM = 70;
   const LOADOUT_STORAGE_KEY = 'geofs-eegs-loadout';
   const AA_HUD_POI_STORAGE_KEY = 'geofs-eegs-aa-hud-poi';
+  const MP_SYNC_STORAGE_KEY = 'geofs-eegs-mp-sync';
+  const MP_SYNC_PREFIX = 'F16EEGS1|';
+  const MP_SYNC_CHAT_PREFIX = 'F16E:';
   const MISSILE_LIMITS = { 'AIM-9X': 4, 'AIM-120D': 6, 'AGM-65': 6 };
   const DEFAULT_MISSILE_LOADOUT = { 'AIM-9X': 4, 'AIM-120D': 6, 'AGM-65': 0 };
   const MAX_MISSILE_LOADOUT = 16;
@@ -79,6 +82,13 @@
   let countermeasureSequence = 0;
   let npcCountermeasures = [];
   let npcCountermeasureSequence = 0;
+  const multiplayerSync = { enabled: false, group: '', sharedHits: 0 };
+  let multiplayerHookRef = null;
+  let originalMultiplayerUpdate = null;
+  let wrappedMultiplayerUpdate = null;
+  let networkMissileSequence = 0;
+  let networkMissiles = [];
+  const receivedNetworkEvents = new Set();
   let lastPos = null, lastT = 0, prevAxes = null;
   const vel = [0, 0, 0];
   const omega = [0, 0, 0];
@@ -157,6 +167,29 @@
       localStorage.setItem(AA_HUD_POI_STORAGE_KEY, String(showAABanditHudPoi));
     } catch (error) {
       toast = { text: 'BANDIT HUD SETTING COULD NOT BE SAVED', until: performance.now() + 3000 };
+    }
+  }
+
+  function loadMultiplayerSyncSettings() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(MP_SYNC_STORAGE_KEY));
+      if (!stored || typeof stored !== 'object') return;
+      multiplayerSync.enabled = stored.enabled === true;
+      multiplayerSync.group = String(stored.group ?? '')
+        .replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+    } catch (error) {
+      toast = { text: 'MULTIPLAYER SYNC SETTINGS COULD NOT BE READ', until: performance.now() + 3000 };
+    }
+  }
+
+  function saveMultiplayerSyncSettings() {
+    try {
+      localStorage.setItem(MP_SYNC_STORAGE_KEY, JSON.stringify({
+        enabled: multiplayerSync.enabled,
+        group: multiplayerSync.group,
+      }));
+    } catch (error) {
+      toast = { text: 'MULTIPLAYER SYNC SETTINGS COULD NOT BE SAVED', until: performance.now() + 3000 };
     }
   }
 
@@ -298,8 +331,14 @@
       combatFieldset.appendChild(controls);
       generalSection.appendChild(combatFieldset);
     }
+    if (!generalSection.querySelector('.f16eegs-mp-controls')) {
+      const multiplayerControls = document.createElement('div');
+      multiplayerControls.className = 'f16eegs-mp-controls';
+      generalSection.querySelector('.f16eegs-combat')?.appendChild(multiplayerControls);
+    }
     renderGeoFsOptionsLoadout();
     renderGeoFsOptionsCombat();
+    renderGeoFsOptionsMultiplayer();
     if (optionsLoadoutObserver) {
       optionsLoadoutObserver.disconnect();
       optionsLoadoutObserver = null;
@@ -678,6 +717,106 @@
     npcMissiles = liveMissiles;
   }
 
+  function updateAndDrawNetworkMissiles(scene, now) {
+    if (!multiplayerSync.enabled || !networkMissiles.length) return;
+    const own = geofs.aircraft.instance.llaLocation;
+    if (!Array.isArray(own) || own.length < 3) return;
+    const ownWorld = Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]);
+    const project = Cesium.SceneTransforms.worldToWindowCoordinates
+      || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const rect = scene.canvas.getBoundingClientRect();
+    const scale = rect.width / scene.canvas.clientWidth || 1;
+    const liveMissiles = [];
+
+    for (const missile of networkMissiles) {
+      const age = (now - missile.t0) / 1000;
+      if (age > missile.maxFlightTime + 5) continue;
+      const dt = Math.min(0.25, Math.max(0, (now - missile.updatedAt) / 1000));
+      const previousPosition = missile.position;
+      const target = ownWorld;
+      const delta = Cesium.Cartesian3.subtract(target, previousPosition, new Cesium.Cartesian3());
+      const distance = Cesium.Cartesian3.magnitude(delta);
+      let nextPosition = previousPosition;
+      if (distance > 0 && dt > 0) {
+        missile.velocity = turnVelocity(
+          missile.velocity,
+          [delta.x, delta.y, delta.z],
+          missile.turnRate * dt
+        );
+        const speed = Math.hypot(...missile.velocity) || 1;
+        missile.velocity = mul(missile.velocity, missile.speed / speed);
+        nextPosition = Cesium.Cartesian3.add(
+          previousPosition,
+          Cesium.Cartesian3.multiplyByScalar(
+            new Cesium.Cartesian3(...missile.velocity), dt, new Cesium.Cartesian3()),
+          new Cesium.Cartesian3()
+        );
+      }
+      if (age > 0.15 && dt > 0) {
+        const segment = Cesium.Cartesian3.subtract(
+          nextPosition, previousPosition, new Cesium.Cartesian3());
+        const segmentLengthSquared = Cesium.Cartesian3.dot(segment, segment);
+        const toTarget = Cesium.Cartesian3.subtract(
+          ownWorld, previousPosition, new Cesium.Cartesian3());
+        const closestFraction = segmentLengthSquared > 0
+          ? Math.max(0, Math.min(1, Cesium.Cartesian3.dot(toTarget, segment) / segmentLengthSquared))
+          : 0;
+        const closestPoint = Cesium.Cartesian3.add(
+          previousPosition,
+          Cesium.Cartesian3.multiplyByScalar(
+            segment, closestFraction, new Cesium.Cartesian3()),
+          new Cesium.Cartesian3());
+        if (Cesium.Cartesian3.distance(closestPoint, ownWorld) <= 35) {
+          const hitEventKey = 'H:' + missile.key;
+          if (!receivedNetworkEvents.has(hitEventKey)) {
+            receivedNetworkEvents.add(hitEventKey);
+            if (receivedNetworkEvents.size > 500) {
+              receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+            }
+            multiplayerSync.sharedHits++;
+            impacts.push({ pos: Cesium.Cartesian3.clone(ownWorld), t0: now });
+            toast = {
+              text: 'SIMULATED MISSILE HIT FROM ' + String(missile.senderId).slice(0, 20),
+              until: now + 3500,
+            };
+          }
+          continue;
+        }
+      }
+      missile.position = nextPosition;
+      missile.updatedAt = now;
+      missile.trail.push(Cesium.Cartesian3.clone(nextPosition));
+      if (missile.trail.length > 18) missile.trail.shift();
+      liveMissiles.push(missile);
+
+      ctx.save();
+      ctx.strokeStyle = '#ff4545';
+      ctx.fillStyle = '#ff4545';
+      ctx.shadowColor = '#ff2020';
+      ctx.shadowBlur = 9;
+      ctx.lineWidth = 2.5;
+      for (let i = 1; i < missile.trail.length; i++) {
+        const from = project.call(Cesium.SceneTransforms, scene, missile.trail[i - 1]);
+        const to = project.call(Cesium.SceneTransforms, scene, missile.trail[i]);
+        if (!from || !to) continue;
+        ctx.globalAlpha = i / missile.trail.length;
+        ctx.beginPath();
+        ctx.moveTo(rect.left + from.x * scale, rect.top + from.y * scale);
+        ctx.lineTo(rect.left + to.x * scale, rect.top + to.y * scale);
+        ctx.stroke();
+      }
+      const point = project.call(Cesium.SceneTransforms, scene, missile.position);
+      if (point) {
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.arc(rect.left + point.x * scale, rect.top + point.y * scale, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    networkMissiles = liveMissiles;
+  }
+
   function drawAAMiniRadar() {
     if (!aaSimulation.active) return;
     const radius = 66;
@@ -811,6 +950,9 @@
       status.textContent += ' | INCOMING: ' + npcMissiles.length
         + ' | HITS TAKEN: ' + aaSimulation.hitsTaken;
     }
+    if (multiplayerSync.enabled && multiplayerSync.group) {
+      status.textContent += ' | MP SYNC ' + multiplayerSync.sharedHits + ' HIT(S)';
+    }
     container.appendChild(status);
 
     const actions = document.createElement('div');
@@ -891,6 +1033,255 @@
       makeButton('Stop Simulation', 'Stop A/A training', () => stopAASimulation(), !aaSimulation.active)
     );
     container.appendChild(actions);
+  }
+
+  function renderGeoFsOptionsMultiplayer() {
+    const container = document.querySelector('.f16eegs-mp-controls');
+    if (!container || container.childElementCount) return;
+    const label = document.createElement('label');
+    Object.assign(label.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      margin: '10px 0 6px',
+    });
+    const enabledInput = document.createElement('input');
+    enabledInput.type = 'checkbox';
+    enabledInput.checked = multiplayerSync.enabled;
+    enabledInput.setAttribute('aria-label', 'Enable multiplayer missile sync');
+    enabledInput.addEventListener('change', () => {
+      multiplayerSync.enabled = enabledInput.checked;
+      saveMultiplayerSyncSettings();
+      if (!multiplayerSync.enabled) networkMissiles = [];
+      if (multiplayerSync.enabled && !multiplayerSync.group) {
+        toast = { text: 'SET A MULTIPLAYER GROUP CODE FIRST', until: performance.now() + 2500 };
+      } else {
+        toast = {
+          text: 'MULTIPLAYER MISSILE SYNC ' + (multiplayerSync.enabled ? 'ON' : 'OFF'),
+          until: performance.now() + 2000,
+        };
+      }
+      renderGeoFsOptionsCombat();
+    });
+    label.append(enabledInput, document.createTextNode('Enable multiplayer missile sync'));
+
+    const groupLabel = document.createElement('label');
+    Object.assign(groupLabel.style, { display: 'flex', alignItems: 'center', gap: '8px' });
+    groupLabel.appendChild(document.createTextNode('Group code'));
+    const groupInput = document.createElement('input');
+    groupInput.type = 'text';
+    groupInput.value = multiplayerSync.group;
+    groupInput.maxLength = 16;
+    groupInput.autocomplete = 'off';
+    groupInput.spellcheck = false;
+    groupInput.placeholder = 'same code for both players';
+    groupInput.setAttribute('aria-label', 'Multiplayer missile sync group code');
+    groupInput.addEventListener('input', () => {
+      const value = groupInput.value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+      if (groupInput.value !== value) groupInput.value = value;
+      multiplayerSync.group = value;
+      saveMultiplayerSyncSettings();
+      renderGeoFsOptionsCombat();
+    });
+    groupLabel.appendChild(groupInput);
+
+    const testButton = document.createElement('button');
+    testButton.type = 'button';
+    testButton.textContent = 'Send Sync Test';
+    testButton.addEventListener('click', () => {
+      if (!multiplayerSync.enabled) {
+        toast = { text: 'ENABLE MULTIPLAYER SYNC FIRST', until: performance.now() + 2500 };
+        return;
+      }
+      if (!multiplayerSync.group) {
+        toast = { text: 'SET A MULTIPLAYER GROUP CODE FIRST', until: performance.now() + 2500 };
+        return;
+      }
+      if (sendMultiplayerSyncEvent([1, 'T', Date.now()])) {
+        toast = { text: 'SYNC TEST SENT; CHECK PUBLIC CHAT', until: performance.now() + 3000 };
+      }
+    });
+
+    const note = document.createElement('p');
+    note.style.margin = '6px 0';
+    note.textContent = 'Both players need this addon, sync enabled, and the same code. Events are Base64-encoded in public chat, but are not private and can be decoded by anyone.';
+    container.append(label, groupLabel, testButton, note);
+  }
+
+  function getMultiplayerSelfId(payload) {
+    const multiplayer = window.multiplayer;
+    return String(multiplayer?.myId ?? multiplayer?.lastResponse?.myId ?? payload?.myId ?? '');
+  }
+
+  function decodeMultiplayerChatText(value) {
+    const text = String(value ?? '');
+    try {
+      return decodeURIComponent(text);
+    } catch (error) {
+      return text;
+    }
+  }
+
+  function encodeMultiplayerSyncText(value) {
+    const bytes = new TextEncoder().encode(value);
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  function decodeMultiplayerSyncText(value) {
+    try {
+      const binary = atob(value);
+      const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function sendMultiplayerSyncEvent(eventData) {
+    if (!multiplayerSync.enabled || !multiplayerSync.group) return false;
+    const multiplayer = window.multiplayer;
+    if (typeof multiplayer?.setChatMessage !== 'function') {
+      toast = { text: 'GEOFS CHAT SYNC API UNAVAILABLE', until: performance.now() + 2500 };
+      return false;
+    }
+    const payload = MP_SYNC_PREFIX + multiplayerSync.group + '|'
+      + JSON.stringify(eventData);
+    const message = MP_SYNC_CHAT_PREFIX + encodeMultiplayerSyncText(payload);
+    if (message.length > 220) {
+      toast = { text: 'MULTIPLAYER EVENT TOO LONG TO SEND', until: performance.now() + 2500 };
+      return false;
+    }
+    try {
+      multiplayer.setChatMessage(message);
+      return true;
+    } catch (error) {
+      toast = { text: 'MULTIPLAYER EVENT COULD NOT BE SENT', until: performance.now() + 2500 };
+      return false;
+    }
+  }
+
+  function processMultiplayerSyncChat(message, payload) {
+    if (!multiplayerSync.enabled || !multiplayerSync.group) return;
+    const senderId = String(message?.uid ?? '');
+    const selfId = getMultiplayerSelfId(payload);
+    if (!senderId || (selfId && senderId === selfId)) return;
+    let text = decodeMultiplayerChatText(message?.msg);
+    if (text.startsWith(MP_SYNC_CHAT_PREFIX)) {
+      text = decodeMultiplayerSyncText(text.slice(MP_SYNC_CHAT_PREFIX.length));
+      if (text === null) return;
+    }
+    const prefix = MP_SYNC_PREFIX + multiplayerSync.group + '|';
+    if (!text.startsWith(prefix)) return;
+
+    let data;
+    try {
+      data = JSON.parse(text.slice(prefix.length));
+    } catch (error) {
+      return;
+    }
+    if (!Array.isArray(data) || data[0] !== 1) return;
+
+    if (data[1] === 'T') {
+      toast = {
+        text: 'MULTIPLAYER SYNC TEST RECEIVED FROM ' + String(message?.cs || 'PLAYER').slice(0, 20),
+        until: performance.now() + 3000,
+      };
+      return;
+    }
+
+    if (data[1] === 'L') {
+      const [, , missileId, targetId, position, velocity, speed, turnRate,
+        maxFlightTime, sentAt] = data;
+      if (String(targetId) !== selfId || !selfId || typeof missileId !== 'string'
+        || !Array.isArray(position) || !Array.isArray(velocity)
+        || position.length !== 3 || velocity.length !== 3
+        || !position.every(Number.isFinite) || !velocity.every(Number.isFinite)
+        || !Number.isFinite(speed) || speed < 200 || speed > 1500
+        || !Number.isFinite(turnRate) || turnRate < 0.1 || turnRate > 3
+        || !Number.isFinite(maxFlightTime) || maxFlightTime < 1 || maxFlightTime > 240
+        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      if (receivedNetworkEvents.has('L:' + key)) return;
+      receivedNetworkEvents.add('L:' + key);
+      if (receivedNetworkEvents.size > 500) {
+        receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+      }
+      networkMissiles.push({
+        key,
+        senderId,
+        missileId,
+        position: new Cesium.Cartesian3(position[0], position[1], position[2]),
+        lastTargetWorld: null,
+        velocity,
+        speed,
+        turnRate,
+        maxFlightTime,
+        t0: performance.now(),
+        updatedAt: performance.now(),
+        trail: [],
+      });
+      if (networkMissiles.length > 32) networkMissiles.shift();
+      toast = {
+        text: String(message?.cs || 'PLAYER').slice(0, 20) + ' LAUNCHED A MISSILE AT YOU',
+        until: performance.now() + 2500,
+      };
+      return;
+    }
+
+    if (data[1] === 'H') {
+      const [, , missileId, targetId, sentAt] = data;
+      if (String(targetId) !== selfId || typeof missileId !== 'string'
+        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      if (receivedNetworkEvents.has('H:' + key)) return;
+      receivedNetworkEvents.add('H:' + key);
+      if (receivedNetworkEvents.size > 500) {
+        receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+      }
+      networkMissiles = networkMissiles.filter(missile => missile.key !== key);
+      multiplayerSync.sharedHits++;
+      const own = geofs.aircraft.instance?.llaLocation;
+      if (Array.isArray(own) && own.length >= 3) {
+        impacts.push({
+          pos: Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]),
+          t0: performance.now(),
+        });
+      }
+      toast = {
+        text: 'MULTIPLAYER MISSILE HIT FROM ' + String(message?.cs || 'PLAYER').slice(0, 20),
+        until: performance.now() + 3500,
+      };
+      return;
+    }
+
+    if (data[1] === 'X') {
+      const [, , missileId, targetId, sentAt] = data;
+      if (String(targetId) !== selfId || typeof missileId !== 'string'
+        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      networkMissiles = networkMissiles.filter(missile => missile.key !== key);
+    }
+  }
+
+  function onMultiplayerUpdate(payload) {
+    const messages = Array.isArray(payload?.chatMessages) ? payload.chatMessages : [];
+    for (const message of messages) processMultiplayerSyncChat(message, payload);
+  }
+
+  function ensureMultiplayerSyncHook() {
+    const multiplayer = window.multiplayer;
+    if (!multiplayer || typeof multiplayer.updateCallback !== 'function') return false;
+    if (multiplayer.updateCallback === wrappedMultiplayerUpdate) return true;
+    originalMultiplayerUpdate = multiplayer.updateCallback;
+    multiplayerHookRef = multiplayer;
+    wrappedMultiplayerUpdate = function (payload) {
+      onMultiplayerUpdate(payload);
+      return originalMultiplayerUpdate.apply(this, arguments);
+    };
+    multiplayer.updateCallback = wrappedMultiplayerUpdate;
+    return true;
   }
 
   function getRadarTargets() {
@@ -1486,7 +1877,7 @@
       Cesium.Cartesian3.fromDegrees(lla[1], lla[0], lla[2]));
     const start = mul(axes[0], 7);
     const velocity = add(vel, mul(axes[0], 850));
-    missiles.push({
+    const missile = {
       enuMat: origin,
       invEnuMat: Cesium.Matrix4.inverseTransformation(origin, new Cesium.Matrix4()),
       t0: now,
@@ -1500,11 +1891,46 @@
       targetId: selectedTarget ? selectedTarget.id : null,
       npcCountermeasureSequence,
       weapon,
-    });
+      networkId: selectedTarget && !selectedTarget.isNpc
+        ? Date.now().toString(36) + '-' + (++networkMissileSequence).toString(36)
+        : null,
+    };
+    missiles.push(missile);
+    let networkSyncStatus = '';
+    if (selectedTarget && !selectedTarget.isNpc && missile.networkId) {
+      const worldPosition = Cesium.Matrix4.multiplyByPoint(
+        origin,
+        new Cesium.Cartesian3(start[0], start[1], start[2]),
+        new Cesium.Cartesian3());
+      const worldVelocity = Cesium.Matrix4.multiplyByPointAsVector(
+        origin,
+        new Cesium.Cartesian3(velocity[0], velocity[1], velocity[2]),
+        new Cesium.Cartesian3());
+      if (!multiplayerSync.enabled) {
+        networkSyncStatus = 'MP SYNC OFF';
+      } else if (!multiplayerSync.group) {
+        networkSyncStatus = 'MP GROUP MISSING';
+      } else {
+        const sent = sendMultiplayerSyncEvent([
+          1,
+          'L',
+          missile.networkId,
+          selectedTarget.id,
+          [worldPosition.x, worldPosition.y, worldPosition.z].map(Math.round),
+          [worldVelocity.x, worldVelocity.y, worldVelocity.z].map(Math.round),
+          900,
+          1.2,
+          missile.maxFlightTime,
+          Date.now(),
+        ]);
+        networkSyncStatus = sent ? 'MP EVENT SENT' : 'MP SEND FAILED';
+      }
+    }
     missileAmmo[weapon]--;
     missileSound();
     toast = {
-      text: selectedTarget ? weapon + ' LAUNCHED: ' + selectedTarget.callsign : weapon + ' LAUNCHED',
+      text: (selectedTarget ? weapon + ' LAUNCHED: ' + selectedTarget.callsign : weapon + ' LAUNCHED')
+        + (networkSyncStatus ? ' | ' + networkSyncStatus : ''),
       until: now + 1500,
     };
   }
@@ -1584,6 +2010,7 @@
       ? getRadarTargets()
       : [];
     updateAndDrawNpcMissiles(scene, nowMs);
+    updateAndDrawNetworkMissiles(scene, nowMs);
 
     if (!enabled || !isF16() || !inCockpit()) {
       tracers = []; missiles = []; impacts = []; gunSound(false); return;
@@ -1640,7 +2067,19 @@
     ctx.clip();
     for (const missile of missiles) {
       const t = (nowMs - missile.t0) / 1000;
-      if (t > missile.maxFlightTime) continue;
+      if (t > missile.maxFlightTime) {
+        if (missile.networkId && !missile.networkTerminalSent) {
+          missile.networkTerminalSent = true;
+          sendMultiplayerSyncEvent([
+            1,
+            'X',
+            missile.networkId,
+            missile.targetId,
+            Date.now(),
+          ]);
+        }
+        continue;
+      }
       const target = missile.targetId &&
         currentTargets.find(contact => contact.id === missile.targetId);
       let position;
@@ -1679,6 +2118,16 @@
             toast = { text: 'PLAYER MISSILE DECOYED BY BANDIT FLARE', until: nowMs + 2000 };
           } else if (target.isNpc) {
             damageAANpcAtWorldPosition(impactPosition, 3, 'MISSILE');
+          } else if (missile.networkId && !missile.networkHitSent) {
+            missile.networkHitSent = true;
+            missile.networkTerminalSent = true;
+            sendMultiplayerSyncEvent([
+              1,
+              'H',
+              missile.networkId,
+              target.id,
+              Date.now(),
+            ]);
           }
           impacts.push({ pos: impactPosition, t0: nowMs });
           continue;
@@ -1704,6 +2153,16 @@
         }
       }
       if (hit) {
+        if (missile.networkId && !missile.networkTerminalSent) {
+          missile.networkTerminalSent = true;
+          sendMultiplayerSyncEvent([
+            1,
+            'X',
+            missile.networkId,
+            missile.targetId,
+            Date.now(),
+          ]);
+        }
         impacts.push({ pos: world, t0: nowMs });
         continue;
       }
@@ -2049,13 +2508,20 @@
   } catch (err) {}
   loadConfiguredMissiles();
   loadAABanditHudPoiSetting();
+  loadMultiplayerSyncSettings();
 
   const boot = setInterval(function () {
     if (document.body) watchGeoFsOptionsLoadout();
+    ensureMultiplayerSyncHook();
     if (document.body && ready()) {
       clearInterval(boot);
       createCanvas();
       requestAnimationFrame(frame);
+      if (!ensureMultiplayerSyncHook()) {
+        const syncHookRetry = setInterval(function () {
+          if (ensureMultiplayerSyncHook()) clearInterval(syncHookRetry);
+        }, 1000);
+      }
       toast = { text: 'EEGS loaded (' + CFG.toggleKey.toUpperCase() + ' to toggle, have fun I guess)', until: performance.now() + 3000 };
     }
   }, 500);
