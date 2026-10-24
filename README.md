@@ -22,3 +22,9 @@ Yes this also work in 4.0
 # Menu
 
 Menu page can be find in "Option -> General" 
+
+# Multi-player
+
+Multi-player setting can be find in menu page
+
+To toggle it, enter room code before connect
