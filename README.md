@@ -23,10 +23,22 @@ Yes this also work in 4.0
 
 Menu page can be find in "Option -> General" 
 
-# Multi-player
+## Multiplayer missile sync
 
-Multi-player setting can be find in menu page
+Multiplayer sync lets two players using this add-on see a simplified incoming missile and receive hit notifications. It uses GeoFS's **public chat** to carry short sync messages; it does not create a private room or hide messages from other players.
 
-To toggle it, enter room code before connect
+### Connect two players
 
-*Room code MUST be 16 charator
+1. Both players should load the same, current `F16EEGS.js` version and join the same GeoFS multiplayer session.
+
+2. In GeoFS **Options -> General**, find the add-on's **A/A Combat Simulation** controls.
+   
+3. On one client, select **Generate Group Code**. Share that 16-character code privately with the other player. The other player must enter the exact same code. Do not generate separate codes for each client.
+   
+4. On both clients, enter the **16 character code** and enable **Enable multiplayer missile sync**.
+   
+5. Select **Send Sync Test** on one client. The other client should display **MULTIPLAYER SYNC TEST RECEIVED**.
+    
+6. To sync a missile, the attacker selects a player aircraft as a target and launches a missile while target mode is on. The targeted player should see the incoming missile effect; a hit is reported with the attacker's callsign when GeoFS provides it.
+
+The code is saved in each browser's local storage. If either player changes it, both clients must use the same new code.
