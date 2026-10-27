@@ -1,0 +1,2859 @@
+
+(function () {
+  'use strict';
+
+  const CFG = {
+    toggleKey: 'u',          // shift+U = reload gun
+    startEnabled: true,
+    onlyF16: true,
+    cockpitOnly: true,
+    orientationSource: 'aircraft',
+    muzzleVelocity: 1050,
+    drag: 0.4,
+    gravity: 9.81,
+    wingspan: 10.7,     
+    minRange: 150,
+    maxRange: 2400,
+    tickRanges: [500, 1000, 1500, 2000],
+    step: 0.03,
+    maxTime: 4,
+    hudFov: { w: 18, h: 20 },   
+    hudOffset: { x: 0, y: 0 },  
+    showHudFrame: false,        
+    maskBottom: 0.62,           
+    ammo: 510,
+    fireRate: 100,
+    fireCode: 'Backslash',
+    tracers: true,
+    tracerEvery: 5,
+    tracerMinDist: 25,      
+    tracerColor: '#eb9800',
+    impactColor: '#707070',  
+    color: '#94ffaf',
+    
+    lineDeg: 0.12,           
+    counterTextDeg: 1.1,     
+    tickTextDeg: 0.8,        
+    crossDeg: 0.7,           
+
+    sound: true,             
+    gunVolume: 0.7,          
+  };
+
+
+  const deg = Math.PI / 180;
+  const R_EARTH = 6378137;
+  const RADAR_RANGE_NM = 70;
+  const LOADOUT_STORAGE_KEY = 'geofs-eegs-loadout';
+  const AA_HUD_POI_STORAGE_KEY = 'geofs-eegs-aa-hud-poi';
+  const MP_SYNC_STORAGE_KEY = 'geofs-eegs-mp-sync';
+  const MP_SYNC_CHAT_PREFIX = 'F7|';
+  const MISSILE_LIMITS = { 'AIM-9X': 4, 'AIM-120D': 6, 'AGM-65': 6 };
+  const DEFAULT_MISSILE_LOADOUT = { 'AIM-9X': 4, 'AIM-120D': 6, 'AGM-65': 0 };
+  const MAX_MISSILE_LOADOUT = 16;
+  const AA_NPC_ID_PREFIX = 'f16eegs-bandit-';
+  const AA_NPC_HIT_RADIUS_M = 28;
+  const AA_NPC_FLARE_RANGE_M = 1800;
+  const GLOC_THRESHOLD = 8;
+  const G_FORCE_DISPLAY_SCALE = 0.4;
+  const GLOC_DETECTION_THRESHOLD = GLOC_THRESHOLD - 0.2;
+  const GLOC_TIME_TO_PASS_OUT = 5;
+  const GLOC_RECOVERY_TIME = 4;
+  const AA_DIFFICULTY_SETTINGS = [
+    { speed: 160, turnRate: 12, attackRangeNm: 8, attackDelay: 14000, missileSpeed: 700, missileTurnRate: 1.1, flareChance: 0.25 },
+    { speed: 185, turnRate: 16, attackRangeNm: 10, attackDelay: 13000, missileSpeed: 750, missileTurnRate: 1.25, flareChance: 0.35 },
+    { speed: 210, turnRate: 20, attackRangeNm: 12, attackDelay: 12000, missileSpeed: 800, missileTurnRate: 1.4, flareChance: 0.45 },
+    { speed: 235, turnRate: 24, attackRangeNm: 14, attackDelay: 11000, missileSpeed: 850, missileTurnRate: 1.55, flareChance: 0.58 },
+    { speed: 265, turnRate: 30, attackRangeNm: 16, attackDelay: 10000, missileSpeed: 950, missileTurnRate: 1.75, flareChance: 0.72 },
+    { speed: 300, turnRate: 36, attackRangeNm: 20, attackDelay: 9000, missileSpeed: 1050, missileTurnRate: 2, flareChance: 0.84 },
+  ];
+  let enabled = CFG.startEnabled;
+  let toast = { text: '', until: 0 };
+  let canvas, ctx, dpr = 1, optionsLoadoutObserver = null;
+  let ammo = CFG.ammo, firing = false, fireAcc = 0, tracerAcc = 0, lastFrame = 0, lastInst = null;
+  let configuredMissiles = { ...DEFAULT_MISSILE_LOADOUT };
+  let missileAmmo = { ...DEFAULT_MISSILE_LOADOUT };
+  let weaponIndex = 0;
+  const WEAPONS = ['GUN', 'AIM-9X', 'AIM-120D', 'AGM-65'];
+  let targetMode = false, selectedTargetId = null, lockedTargetId = null, currentTargets = [];
+  let tracers = [], missiles = [], npcMissiles = [], impacts = [];
+  const aaSimulation = { active: false, npcs: [], kills: 0, hits: 0, hitsTaken: 0, lastUiUpdate: 0 };
+  let selectedAADifficulty = 3;
+  let selectedAABanditCount = 1;
+  let showAABanditHudPoi = true;
+  let aaNpcSequence = 0;
+  let countermeasures = [];
+  let countermeasureSequence = 0;
+  let npcCountermeasures = [];
+  let npcCountermeasureSequence = 0;
+  const multiplayerSync = { enabled: false, group: '', sharedHits: 0 };
+  let originalMultiplayerUpdate = null;
+  let wrappedMultiplayerUpdate = null;
+  let networkMissileSequence = 0;
+  let networkMissiles = [];
+  const receivedNetworkEvents = new Set();
+  const seenMultiplayerChatMessages = new Set();
+  let lastPos = null, lastT = 0, prevAxes = null;
+  let lastMeasuredVelocity = null;
+  let gLoad = 1, gLoadTime = 0, gPassedOut = false, gRecoveryRemaining = 0;
+  let gEffectCanvas = null, gEffectBaseFilter = '';
+  const vel = [0, 0, 0];
+  const omega = [0, 0, 0];
+
+
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+
+
+  function ready() {
+    return window.geofs && geofs.aircraft && geofs.aircraft.instance &&
+      geofs.api && geofs.api.viewer && window.Cesium &&
+      geofs.animation && geofs.animation.values;
+  }
+
+  function isF16() {
+    if (!CFG.onlyF16) return true;
+    const inst = geofs.aircraft.instance;
+    const names = [inst.aircraftRecord && inst.aircraftRecord.name,
+      inst.definition && inst.definition.name].filter(Boolean).join(' ');
+    return /f[-\s]?16/i.test(names);
+  }
+
+  function inCockpit() {
+    if (!CFG.cockpitOnly) return true;
+    const c = geofs.camera;
+    if (!c) return true;
+    const name = String(c.currentModeName || '').toLowerCase();
+    return name ? name.includes('cockpit') : c.currentMode === 0;
+  }
+
+  function typing(e) {
+    const t = e.target;
+    return t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+      t.tagName === 'SELECT' || t.isContentEditable);
+  }
+
+  function normalizeMissileLoadout(value) {
+    const result = {};
+    let total = 0;
+    for (const [weapon, limit] of Object.entries(MISSILE_LIMITS)) {
+      const requested = Number(value && value[weapon]);
+      const count = Number.isInteger(requested) ? Math.max(0, Math.min(limit, requested)) : 0;
+      result[weapon] = Math.min(count, MAX_MISSILE_LOADOUT - total);
+      total += result[weapon];
+    }
+    return result;
+  }
+
+  function loadConfiguredMissiles() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(LOADOUT_STORAGE_KEY));
+      configuredMissiles = stored
+        ? normalizeMissileLoadout(stored)
+        : { ...DEFAULT_MISSILE_LOADOUT };
+    } catch (error) {
+      configuredMissiles = { ...DEFAULT_MISSILE_LOADOUT };
+      toast = { text: 'LOADOUT SETTINGS COULD NOT BE READ', until: performance.now() + 3000 };
+    }
+    missileAmmo = { ...configuredMissiles };
+  }
+
+  function loadAABanditHudPoiSetting() {
+    try {
+      const stored = localStorage.getItem(AA_HUD_POI_STORAGE_KEY);
+      if (stored !== null) showAABanditHudPoi = stored === 'true';
+    } catch (error) {
+      toast = { text: 'BANDIT HUD SETTING COULD NOT BE READ', until: performance.now() + 3000 };
+    }
+  }
+
+  function saveAABanditHudPoiSetting() {
+    try {
+      localStorage.setItem(AA_HUD_POI_STORAGE_KEY, String(showAABanditHudPoi));
+    } catch (error) {
+      toast = { text: 'BANDIT HUD SETTING COULD NOT BE SAVED', until: performance.now() + 3000 };
+    }
+  }
+
+  function loadMultiplayerSyncSettings() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(MP_SYNC_STORAGE_KEY));
+      if (!stored || typeof stored !== 'object') return;
+      multiplayerSync.enabled = stored.enabled === true;
+      multiplayerSync.group = String(stored.group ?? '')
+        .replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+    } catch (error) {
+      toast = { text: 'MULTIPLAYER SYNC SETTINGS COULD NOT BE READ', until: performance.now() + 3000 };
+    }
+  }
+
+  function saveMultiplayerSyncSettings() {
+    try {
+      localStorage.setItem(MP_SYNC_STORAGE_KEY, JSON.stringify({
+        enabled: multiplayerSync.enabled,
+        group: multiplayerSync.group,
+      }));
+    } catch (error) {
+      toast = { text: 'MULTIPLAYER SYNC SETTINGS COULD NOT BE SAVED', until: performance.now() + 3000 };
+    }
+  }
+
+  function saveConfiguredMissiles() {
+    try {
+      localStorage.setItem(LOADOUT_STORAGE_KEY, JSON.stringify(configuredMissiles));
+      return true;
+    } catch (error) {
+      toast = { text: 'LOADOUT SETTINGS COULD NOT BE SAVED', until: performance.now() + 3000 };
+      return false;
+    }
+  }
+
+  function adjustConfiguredMissiles(weapon, delta) {
+    const limit = MISSILE_LIMITS[weapon];
+    if (!Number.isFinite(limit)) return;
+    const counts = normalizeMissileLoadout(configuredMissiles);
+    const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+    const next = counts[weapon] + Math.sign(delta);
+    if (next < 0 || next > limit || (next > counts[weapon] && total >= MAX_MISSILE_LOADOUT)) return;
+    counts[weapon] = next;
+    configuredMissiles = counts;
+    saveConfiguredMissiles();
+    renderGeoFsOptionsLoadout();
+  }
+
+  function applyConfiguredMissiles() {
+    configuredMissiles = normalizeMissileLoadout(configuredMissiles);
+    missileAmmo = { ...configuredMissiles };
+    const total = Object.values(missileAmmo).reduce((sum, count) => sum + count, 0);
+    toast = { text: 'LOADOUT READY: ' + total + ' MISSILES', until: performance.now() + 2000 };
+  }
+
+  function renderGeoFsOptionsLoadout() {
+    const container = document.querySelector('.f16eegs-loadout-controls');
+    if (!container) return;
+    container.replaceChildren();
+
+    const makeButton = (text, ariaLabel, onClick) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'mdl-button mdl-js-button mdl-button--raised mdl-button--colored';
+      button.textContent = text;
+      button.setAttribute('aria-label', ariaLabel);
+      button.addEventListener('click', event => event.stopPropagation());
+      button.addEventListener('click', onClick);
+      return button;
+    };
+    const makeRow = (weapon, limit) => {
+      const row = document.createElement('div');
+      Object.assign(row.style, {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(100px, 1fr) auto minmax(54px, auto) auto',
+        alignItems: 'center',
+        gap: '8px',
+        margin: '8px 0',
+      });
+      const name = document.createElement('span');
+      name.textContent = weapon;
+      const quantity = document.createElement('span');
+      quantity.className = 'f16eegs-loadout-quantity';
+      quantity.textContent = configuredMissiles[weapon] + ' / ' + limit;
+      quantity.style.textAlign = 'center';
+      row.append(
+        name,
+        makeButton('-', 'Remove one ' + weapon, () => adjustConfiguredMissiles(weapon, -1)),
+        quantity,
+        makeButton('+', 'Add one ' + weapon, () => adjustConfiguredMissiles(weapon, 1))
+      );
+      return row;
+    };
+
+    for (const [weapon, limit] of Object.entries(MISSILE_LIMITS)) {
+      container.appendChild(makeRow(weapon, limit));
+    }
+
+    const total = Object.values(configuredMissiles).reduce((sum, count) => sum + count, 0);
+    const summary = document.createElement('p');
+    summary.className = 'f16eegs-loadout-total';
+    summary.textContent = 'Total: ' + total + ' / ' + MAX_MISSILE_LOADOUT;
+    container.appendChild(summary);
+
+    const actions = document.createElement('div');
+    Object.assign(actions.style, { display: 'flex', flexWrap: 'wrap', gap: '8px' });
+    actions.append(
+      makeButton('Apply Loadout', 'Apply selected missile loadout', applyConfiguredMissiles),
+      makeButton('Max', 'Set each missile type to its maximum', () => {
+        configuredMissiles = normalizeMissileLoadout(MISSILE_LIMITS);
+        saveConfiguredMissiles();
+        renderGeoFsOptionsLoadout();
+      }),
+      makeButton('Reset', 'Restore default missile loadout', () => {
+        configuredMissiles = { ...DEFAULT_MISSILE_LOADOUT };
+        saveConfiguredMissiles();
+        renderGeoFsOptionsLoadout();
+      })
+    );
+    container.appendChild(actions);
+  }
+
+  function ensureGeoFsOptionsLoadout() {
+    const preferences = document.querySelector('.geofs-preferences');
+    const generalSection = preferences?.querySelector(':scope > li:first-of-type > .geofs-collapsible');
+    if (!generalSection) return false;
+
+    let fieldset = generalSection.querySelector('.f16eegs-loadout');
+    if (!fieldset) {
+      fieldset = document.createElement('fieldset');
+      fieldset.className = 'f16eegs-loadout';
+      const legend = document.createElement('legend');
+      legend.textContent = 'F-16 EEGS Missile Loadout';
+      fieldset.appendChild(legend);
+
+      const instructions = document.createElement('p');
+      instructions.textContent = 'Choose missiles to carry. Limits: 4 AIM-9X, 6 AIM-120D, 6 AGM-65; 16 total.';
+      instructions.style.margin = '8px 0';
+      fieldset.appendChild(instructions);
+
+      const controls = document.createElement('div');
+      controls.className = 'f16eegs-loadout-controls';
+      fieldset.appendChild(controls);
+      generalSection.appendChild(fieldset);
+    }
+    let combatFieldset = generalSection.querySelector('.f16eegs-combat');
+    if (!combatFieldset) {
+      combatFieldset = document.createElement('fieldset');
+      combatFieldset.className = 'f16eegs-combat';
+      const legend = document.createElement('legend');
+      legend.textContent = 'A/A Combat Simulation';
+      combatFieldset.appendChild(legend);
+
+      const instructions = document.createElement('p');
+      instructions.textContent = 'Choose difficulty (1 easy to 6 hardest) and 1-10 bandits. Each bandit spawns at a random spot 5-30 NM away, facing a random heading. Settings apply when you start/restart. Bandits fire training missiles and use flares; evade incoming missiles with Backspace. The 30 NM mini-radar appears during the simulation.';
+      instructions.style.margin = '8px 0';
+      combatFieldset.appendChild(instructions);
+
+      const controls = document.createElement('div');
+      controls.className = 'f16eegs-combat-controls';
+      combatFieldset.appendChild(controls);
+      generalSection.appendChild(combatFieldset);
+    }
+    if (!generalSection.querySelector('.f16eegs-mp-controls')) {
+      const multiplayerControls = document.createElement('div');
+      multiplayerControls.className = 'f16eegs-mp-controls';
+      generalSection.querySelector('.f16eegs-combat')?.appendChild(multiplayerControls);
+    }
+    renderGeoFsOptionsLoadout();
+    renderGeoFsOptionsCombat();
+    renderGeoFsOptionsMultiplayer();
+    if (optionsLoadoutObserver) {
+      optionsLoadoutObserver.disconnect();
+      optionsLoadoutObserver = null;
+    }
+    return true;
+  }
+
+  function watchGeoFsOptionsLoadout() {
+    if (ensureGeoFsOptionsLoadout() || optionsLoadoutObserver || !document.body) return;
+    optionsLoadoutObserver = new MutationObserver(() => {
+      ensureGeoFsOptionsLoadout();
+    });
+    optionsLoadoutObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function normalizeHeading(heading) {
+    return ((heading % 360) + 360) % 360;
+  }
+
+  function angleDifference(from, to) {
+    return ((to - from + 540) % 360) - 180;
+  }
+
+  function moveGeoPoint(lat, lon, northMeters, eastMeters) {
+    const latitudeRad = lat * deg;
+    const nextLat = lat + northMeters / R_EARTH / deg;
+    const longitudeScale = Math.max(0.01, Math.cos(latitudeRad));
+    const nextLon = lon + eastMeters / (R_EARTH * longitudeScale) / deg;
+    return { lat: nextLat, lon: nextLon };
+  }
+
+  function startAASimulation() {
+    if (!ready() || !isF16()) {
+      toast = { text: 'A/A SIM REQUIRES THE F-16 TO BE READY', until: performance.now() + 2500 };
+      return;
+    }
+
+    const own = geofs.aircraft.instance.llaLocation;
+    if (!Array.isArray(own) || !Number.isFinite(own[0]) || !Number.isFinite(own[1])
+      || !Number.isFinite(own[2])) {
+      toast = { text: 'A/A SIM: AIRCRAFT POSITION UNAVAILABLE', until: performance.now() + 2500 };
+      return;
+    }
+
+    const now = performance.now();
+    const oldNpcIds = new Set(aaSimulation.npcs.map(npc => npc.id));
+    missiles = missiles.filter(missile => !oldNpcIds.has(missile.targetId));
+    npcMissiles = [];
+    tracers = [];
+    const difficulty = selectedAADifficulty;
+    const difficultySettings = AA_DIFFICULTY_SETTINGS[difficulty - 1];
+    const counts = normalizeMissileLoadout(configuredMissiles);
+    configuredMissiles = counts;
+    missileAmmo = { ...counts };
+    aaSimulation.active = true;
+    aaSimulation.npcs = Array.from({ length: selectedAABanditCount }, (_, index) => {
+      const side = index % 2 === 0 ? 1 : -1;
+      const distanceNm = Math.sqrt(5 ** 2 + Math.random() * (30 ** 2 - 5 ** 2));
+      const bearing = Math.random() * Math.PI * 2;
+      const distanceMeters = distanceNm * 1852;
+      const position = moveGeoPoint(
+        own[0],
+        own[1],
+        Math.cos(bearing) * distanceMeters,
+        Math.sin(bearing) * distanceMeters
+      );
+      const sequence = ++aaNpcSequence;
+      return {
+        id: AA_NPC_ID_PREFIX + sequence,
+        callsign: 'BANDIT ' + (index + 1),
+        lat: position.lat,
+        lon: position.lon,
+        alt: Math.max(0, Number(own[2]) + 150 + (index % 3) * 80),
+        heading: Math.random() * 360,
+        lastUpdate: now,
+        elapsed: 0,
+        health: 3,
+        side,
+        difficulty,
+        nextAttackAt: now + difficultySettings.attackDelay * 0.5 + index * 1700,
+        nextFlareAt: now + 3000 + index * 900
+      };
+    });
+    npcCountermeasures = [];
+    targetMode = true;
+    selectedTargetId = aaSimulation.npcs[0]?.id ?? null;
+    lockedTargetId = null;
+    currentTargets = getRadarTargets();
+    toast = {
+      text: 'A/A SIM STARTED - ' + selectedAABanditCount + ' BANDIT(S), DIFFICULTY '
+        + difficulty + '/6',
+      until: now + 2500
+    };
+    renderGeoFsOptionsCombat();
+  }
+
+  function stopAASimulation(message = 'A/A SIM STOPPED') {
+    const npcIds = new Set(aaSimulation.npcs.map(npc => npc.id));
+    aaSimulation.active = false;
+    aaSimulation.npcs = [];
+    missiles = missiles.filter(missile => !npcIds.has(missile.targetId));
+    npcMissiles = [];
+    npcCountermeasures = [];
+    tracers = [];
+    if (npcIds.has(selectedTargetId)) selectedTargetId = null;
+    if (npcIds.has(lockedTargetId)) lockedTargetId = null;
+    currentTargets = getRadarTargets();
+    toast = { text: message, until: performance.now() + 2000 };
+    renderGeoFsOptionsCombat();
+  }
+
+  function updateAASimulation(now, dt) {
+    if (!aaSimulation.active || !aaSimulation.npcs.length) return;
+    const own = geofs.aircraft.instance.llaLocation;
+    if (!Array.isArray(own) || !Number.isFinite(own[0]) || !Number.isFinite(own[1])) return;
+
+    for (const npc of aaSimulation.npcs) {
+      updateAANpc(npc, own, now, dt);
+    }
+    if (now - aaSimulation.lastUiUpdate > 1000) {
+      aaSimulation.lastUiUpdate = now;
+      renderGeoFsOptionsCombat();
+    }
+  }
+
+  function updateAANpc(npc, own, now, dt) {
+    const settings = AA_DIFFICULTY_SETTINGS[npc.difficulty - 1];
+    const dLon = (own[1] - npc.lon) * deg;
+    const lat1 = npc.lat * deg;
+    const lat2 = own[0] * deg;
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2)
+      - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    const bearingToPlayer = normalizeHeading(Math.atan2(y, x) / deg);
+    npc.elapsed += dt;
+
+    const maneuver = Math.sin(npc.elapsed * 0.32) * (12 + npc.difficulty * 2);
+    const desiredHeading = normalizeHeading(bearingToPlayer + npc.side * (8 + maneuver));
+    const maxTurn = settings.turnRate * dt;
+    npc.heading = normalizeHeading(
+      npc.heading + Math.max(-maxTurn, Math.min(maxTurn, angleDifference(npc.heading, desiredHeading)))
+    );
+
+    const headingRad = npc.heading * deg;
+    const travel = settings.speed * dt;
+    const position = moveGeoPoint(
+      npc.lat,
+      npc.lon,
+      Math.cos(headingRad) * travel,
+      Math.sin(headingRad) * travel
+    );
+    npc.lat = position.lat;
+    npc.lon = position.lon;
+    npc.alt = Math.max(30, npc.alt + Math.sin(npc.elapsed * 0.7) * 8 * dt);
+    npc.lastUpdate = now;
+
+    const ownWorld = Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]);
+    const npcWorld = Cesium.Cartesian3.fromDegrees(npc.lon, npc.lat, npc.alt);
+    const range = Cesium.Cartesian3.distance(ownWorld, npcWorld);
+    const incomingMissile = missiles.some(missile => {
+      if (missile.targetId !== npc.id) return false;
+      const missileWorld = worldPosition(missile.enuMat, missile.position);
+      return Cesium.Cartesian3.distance(missileWorld, npcWorld) <= AA_NPC_FLARE_RANGE_M;
+    });
+    if (incomingMissile && now >= npc.nextFlareAt) {
+      releaseAANpcFlares(npc, now);
+      npc.nextFlareAt = now + Math.max(3500, 11000 - npc.difficulty * 1000)
+        + Math.random() * 2500;
+      toast = { text: npc.callsign + ' FLARES - MISSILE SEEKER MAY BE DECOYED', until: now + 2200 };
+    }
+    const missileAlreadyLaunched = npcMissiles.some(missile => missile.sourceId === npc.id);
+    if (now >= npc.nextAttackAt && range <= settings.attackRangeNm * 1852
+      && !missileAlreadyLaunched) {
+      const direction = Cesium.Cartesian3.subtract(ownWorld, npcWorld, new Cesium.Cartesian3());
+      Cesium.Cartesian3.normalize(direction, direction);
+      const velocity = Cesium.Cartesian3.multiplyByScalar(
+        direction, settings.missileSpeed, new Cesium.Cartesian3());
+      npcMissiles.push({
+        sourceId: npc.id,
+        callsign: npc.callsign,
+        position: npcWorld,
+        lastTargetWorld: Cesium.Cartesian3.clone(ownWorld),
+        velocity,
+        t0: now,
+        updatedAt: now,
+        maxFlightTime: 60,
+        speed: settings.missileSpeed,
+        turnRate: settings.missileTurnRate,
+        trail: [],
+        countermeasureSequence
+      });
+      npc.nextAttackAt = now + settings.attackDelay + Math.random() * settings.attackDelay * 0.35;
+      toast = { text: npc.callsign + ' MISSILE LAUNCH - BREAK / BACKSPACE', until: now + 2500 };
+    }
+  }
+
+  function releaseAANpcFlares(npc, now) {
+    const origin = Cesium.Transforms.eastNorthUpToFixedFrame(
+      Cesium.Cartesian3.fromDegrees(npc.lon, npc.lat, npc.alt));
+    const heading = npc.heading * deg;
+    const forward = [Math.sin(heading), Math.cos(heading), 0];
+    const right = [Math.cos(heading), -Math.sin(heading), 0];
+    const sequence = ++npcCountermeasureSequence;
+    for (let i = 0; i < 4; i++) {
+      npcCountermeasures.push({
+        type: 'flare',
+        ownerId: npc.id,
+        sequence,
+        t0: now,
+        life: 1.8,
+        origin,
+        offset: add(mul(forward, -8), mul(right, (Math.random() - 0.5) * 7)),
+        velocity: add(mul(forward, -18 - Math.random() * 8),
+          add(mul(right, (Math.random() - 0.5) * 9), [0, 0, 3 + Math.random() * 3])),
+      });
+    }
+  }
+
+  function aaNpcFlareWorldPosition(flare, now) {
+    const age = Math.max(0, (now - flare.t0) / 1000);
+    const localPosition = add(flare.offset,
+      add(mul(flare.velocity, age), [0, 0, -4.905 * age * age]));
+    return Cesium.Matrix4.multiplyByPoint(flare.origin,
+      new Cesium.Cartesian3(localPosition[0], localPosition[1], localPosition[2]),
+      new Cesium.Cartesian3());
+  }
+
+  function drawAANpcFlares(scene, now) {
+    if (!npcCountermeasures.length) return;
+    npcCountermeasures = npcCountermeasures.filter(flare => now - flare.t0 < flare.life);
+    const project = Cesium.SceneTransforms.worldToWindowCoordinates
+      || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    ctx.save();
+    ctx.fillStyle = '#ffd26a';
+    ctx.shadowColor = '#ff5a18';
+    ctx.shadowBlur = 18;
+    for (const flare of npcCountermeasures) {
+      const screen = project.call(Cesium.SceneTransforms, scene,
+        aaNpcFlareWorldPosition(flare, now));
+      if (!screen) continue;
+      ctx.globalAlpha = Math.max(0, 1 - (now - flare.t0) / (flare.life * 1000));
+      ctx.beginPath();
+      ctx.arc(screen.x, screen.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function countermeasureWorldPosition(countermeasure, now) {
+    const age = Math.max(0, (now - countermeasure.t0) / 1000);
+    const localPosition = add(countermeasure.offset,
+      add(mul(countermeasure.velocity, age), [0, 0, -4.905 * age * age]));
+    return Cesium.Matrix4.multiplyByPoint(countermeasure.origin,
+      new Cesium.Cartesian3(localPosition[0], localPosition[1], localPosition[2]),
+      new Cesium.Cartesian3());
+  }
+
+  function updateAndDrawNpcMissiles(scene, now) {
+    if (!npcMissiles.length) return;
+    const own = geofs.aircraft.instance.llaLocation;
+    if (!Array.isArray(own) || own.length < 3) return;
+    const ownWorld = Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]);
+    const project = Cesium.SceneTransforms.worldToWindowCoordinates
+      || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const liveMissiles = [];
+
+    for (const missile of npcMissiles) {
+      const age = (now - missile.t0) / 1000;
+      if (age > missile.maxFlightTime) {
+        toast = { text: 'BANDIT MISSILE EXPIRED', until: now + 1500 };
+        continue;
+      }
+
+      if (missile.decoy && now - missile.decoy.t0 >= missile.decoy.life) {
+        missile.decoy = null;
+        missile.lastTargetWorld = Cesium.Cartesian3.clone(ownWorld);
+      }
+
+      const newCountermeasures = countermeasures.filter(item =>
+        item.sequence > missile.countermeasureSequence && now - item.t0 < item.life);
+      if (newCountermeasures.length) {
+        missile.countermeasureSequence = Math.max(...newCountermeasures.map(item => item.sequence));
+        const flares = newCountermeasures.filter(item => item.type === 'flare');
+        const chaff = newCountermeasures.filter(item => item.type === 'chaff');
+        const decoy = flares[0] || chaff[0];
+        const decoyChance = flares.length ? 0.78 : 0.3;
+        if (decoy && Math.random() < decoyChance) {
+          missile.decoy = decoy;
+          missile.lastTargetWorld = countermeasureWorldPosition(decoy, now);
+          toast = { text: decoy.type.toUpperCase() + ' DECOYING BANDIT MISSILE', until: now + 1800 };
+        }
+      }
+
+      const target = missile.decoy
+        ? countermeasureWorldPosition(missile.decoy, now)
+        : ownWorld;
+      const delta = Cesium.Cartesian3.subtract(target, missile.position, new Cesium.Cartesian3());
+      const distance = Cesium.Cartesian3.magnitude(delta);
+      const dt = Math.min(0.25, Math.max(0, (now - missile.updatedAt) / 1000));
+      const previousPosition = missile.position;
+      let nextPosition = previousPosition;
+      if (distance > 0 && dt > 0) {
+        missile.velocity = turnVelocity(
+          [missile.velocity.x, missile.velocity.y, missile.velocity.z],
+          [delta.x, delta.y, delta.z],
+          missile.turnRate * dt
+        );
+        const speed = Math.hypot(...missile.velocity) || 1;
+        missile.velocity = mul(missile.velocity, missile.speed / speed);
+        nextPosition = Cesium.Cartesian3.add(previousPosition,
+          Cesium.Cartesian3.multiplyByScalar(
+            new Cesium.Cartesian3(...missile.velocity), dt, new Cesium.Cartesian3()),
+          new Cesium.Cartesian3());
+      }
+      const previousTarget = missile.lastTargetWorld || target;
+      const relativeStart = Cesium.Cartesian3.subtract(
+        previousPosition, previousTarget, new Cesium.Cartesian3());
+      const relativeEnd = Cesium.Cartesian3.subtract(
+        nextPosition, target, new Cesium.Cartesian3());
+      const relativeTravel = Cesium.Cartesian3.subtract(
+        relativeEnd, relativeStart, new Cesium.Cartesian3());
+      const relativeTravelSquared = Cesium.Cartesian3.dot(relativeTravel, relativeTravel);
+      const closestFraction = relativeTravelSquared > 0
+        ? Math.max(0, Math.min(1,
+          -Cesium.Cartesian3.dot(relativeStart, relativeTravel) / relativeTravelSquared))
+        : 0;
+      const closestPoint = Cesium.Cartesian3.add(
+        relativeStart,
+        Cesium.Cartesian3.multiplyByScalar(
+          relativeTravel, closestFraction, new Cesium.Cartesian3()),
+        new Cesium.Cartesian3());
+      const hitRadius = missile.decoy ? 10 : 55;
+      if (Cesium.Cartesian3.magnitude(closestPoint) <= hitRadius) {
+        if (missile.decoy) {
+          toast = { text: 'BANDIT MISSILE DEFEATED BY ' + missile.decoy.type.toUpperCase(), until: now + 2000 };
+        } else {
+          aaSimulation.hitsTaken++;
+          toast = { text: 'SIMULATED MISSILE HIT - EVADE WITH BACKSPACE', until: now + 2500 };
+          renderGeoFsOptionsCombat();
+        }
+        continue;
+      }
+
+      missile.position = nextPosition;
+      missile.lastTargetWorld = Cesium.Cartesian3.clone(target);
+      missile.updatedAt = now;
+      missile.trail.push(Cesium.Cartesian3.clone(missile.position));
+      if (missile.trail.length > 12) missile.trail.shift();
+      liveMissiles.push(missile);
+
+      ctx.save();
+      ctx.strokeStyle = '#ff5555';
+      ctx.fillStyle = '#ff5555';
+      ctx.shadowColor = '#ff3333';
+      ctx.shadowBlur = 8;
+      ctx.lineWidth = 2;
+      for (let i = 1; i < missile.trail.length; i++) {
+        const from = project.call(Cesium.SceneTransforms, scene, missile.trail[i - 1]);
+        const to = project.call(Cesium.SceneTransforms, scene, missile.trail[i]);
+        if (!from || !to) continue;
+        ctx.globalAlpha = i / missile.trail.length;
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+        ctx.stroke();
+      }
+      const screen = project.call(Cesium.SceneTransforms, scene, missile.position);
+      if (screen) {
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.arc(screen.x, screen.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    npcMissiles = liveMissiles;
+  }
+
+  function updateAndDrawNetworkMissiles(scene, now) {
+    if (!multiplayerSync.enabled || !networkMissiles.length) return;
+    const own = geofs.aircraft.instance.llaLocation;
+    if (!Array.isArray(own) || own.length < 3) return;
+    const ownWorld = Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]);
+    const project = Cesium.SceneTransforms.worldToWindowCoordinates
+      || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const rect = scene.canvas.getBoundingClientRect();
+    const scale = rect.width / scene.canvas.clientWidth || 1;
+    const liveMissiles = [];
+
+    for (const missile of networkMissiles) {
+      const age = (now - missile.t0) / 1000;
+      if (age > missile.maxFlightTime + 5) continue;
+      const dt = Math.min(0.25, Math.max(0, (now - missile.updatedAt) / 1000));
+      const previousPosition = missile.position;
+      const target = ownWorld;
+      const delta = Cesium.Cartesian3.subtract(target, previousPosition, new Cesium.Cartesian3());
+      const distance = Cesium.Cartesian3.magnitude(delta);
+      let nextPosition = previousPosition;
+      if (distance > 0 && dt > 0) {
+        missile.velocity = turnVelocity(
+          missile.velocity,
+          [delta.x, delta.y, delta.z],
+          missile.turnRate * dt
+        );
+        const speed = Math.hypot(...missile.velocity) || 1;
+        missile.velocity = mul(missile.velocity, missile.speed / speed);
+        nextPosition = Cesium.Cartesian3.add(
+          previousPosition,
+          Cesium.Cartesian3.multiplyByScalar(
+            new Cesium.Cartesian3(...missile.velocity), dt, new Cesium.Cartesian3()),
+          new Cesium.Cartesian3()
+        );
+      }
+      if (age > 0.15 && dt > 0) {
+        const segment = Cesium.Cartesian3.subtract(
+          nextPosition, previousPosition, new Cesium.Cartesian3());
+        const segmentLengthSquared = Cesium.Cartesian3.dot(segment, segment);
+        const toTarget = Cesium.Cartesian3.subtract(
+          ownWorld, previousPosition, new Cesium.Cartesian3());
+        const closestFraction = segmentLengthSquared > 0
+          ? Math.max(0, Math.min(1, Cesium.Cartesian3.dot(toTarget, segment) / segmentLengthSquared))
+          : 0;
+        const closestPoint = Cesium.Cartesian3.add(
+          previousPosition,
+          Cesium.Cartesian3.multiplyByScalar(
+            segment, closestFraction, new Cesium.Cartesian3()),
+          new Cesium.Cartesian3());
+        if (Cesium.Cartesian3.distance(closestPoint, ownWorld) <= 35) {
+          const hitEventKey = 'H:' + missile.key;
+          if (!receivedNetworkEvents.has(hitEventKey)) {
+            receivedNetworkEvents.add(hitEventKey);
+            if (receivedNetworkEvents.size > 500) {
+              receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+            }
+            multiplayerSync.sharedHits++;
+            impacts.push({ pos: Cesium.Cartesian3.clone(ownWorld), t0: now });
+            toast = {
+              text: 'MISSILE HIT FROM ' + getMultiplayerUserLabel(missile.senderId),
+              until: now + 3500,
+            };
+          }
+          continue;
+        }
+      }
+      missile.position = nextPosition;
+      missile.updatedAt = now;
+      missile.trail.push(Cesium.Cartesian3.clone(nextPosition));
+      if (missile.trail.length > 18) missile.trail.shift();
+      liveMissiles.push(missile);
+
+      ctx.save();
+      ctx.strokeStyle = '#ff4545';
+      ctx.fillStyle = '#ff4545';
+      ctx.shadowColor = '#ff2020';
+      ctx.shadowBlur = 9;
+      ctx.lineWidth = 2.5;
+      for (let i = 1; i < missile.trail.length; i++) {
+        const from = project.call(Cesium.SceneTransforms, scene, missile.trail[i - 1]);
+        const to = project.call(Cesium.SceneTransforms, scene, missile.trail[i]);
+        if (!from || !to) continue;
+        ctx.globalAlpha = i / missile.trail.length;
+        ctx.beginPath();
+        ctx.moveTo(rect.left + from.x * scale, rect.top + from.y * scale);
+        ctx.lineTo(rect.left + to.x * scale, rect.top + to.y * scale);
+        ctx.stroke();
+      }
+      const point = project.call(Cesium.SceneTransforms, scene, missile.position);
+      if (point) {
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.arc(rect.left + point.x * scale, rect.top + point.y * scale, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    networkMissiles = liveMissiles;
+  }
+
+  function drawAAMiniRadar() {
+    if (!aaSimulation.active) return;
+    const radius = 66;
+    const centerX = innerWidth - radius - 24;
+    const centerY = innerHeight - radius - 42;
+    const rangeNm = 30;
+    const pixelsPerNm = radius / rangeNm;
+    const ownHeading = Number(geofs.animation.values.heading360
+      || geofs.animation.values.heading) || 0;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 18, 12, 0.78)';
+    ctx.strokeStyle = '#94ffaf';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.globalAlpha = 0.5;
+    for (const ring of [10, 20, 30]) {
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, ring * pixelsPerNm, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(centerX - radius, centerY);
+    ctx.lineTo(centerX + radius, centerY);
+    ctx.moveTo(centerX, centerY - radius);
+    ctx.lineTo(centerX, centerY + radius);
+    ctx.stroke();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#94ffaf';
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, 3, 0, Math.PI * 2);
+    ctx.fill();
+    for (const target of currentTargets) {
+      if (target.rangeNm > rangeNm) continue;
+      const angle = angleDifference(ownHeading, target.bearing) * deg;
+      const x = centerX + Math.sin(angle) * target.rangeNm * pixelsPerNm;
+      const y = centerY - Math.cos(angle) * target.rangeNm * pixelsPerNm;
+      ctx.fillStyle = target.isNpc ? '#ffab55' : '#61d9ff';
+      ctx.beginPath();
+      ctx.arc(x, y, target.isNpc ? 4 : 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (const missile of npcMissiles) {
+      const position = Cesium.Cartographic.fromCartesian(missile.position);
+      const own = geofs.aircraft.instance.llaLocation;
+      if (!position || !own) continue;
+      const targetLat = position.latitude / deg;
+      const targetLon = position.longitude / deg;
+      const dLat = (targetLat - own[0]) * deg;
+      const dLon = (targetLon - own[1]) * deg;
+      const north = dLat * R_EARTH;
+      const east = dLon * R_EARTH * Math.cos(own[0] * deg);
+      const bearing = normalizeHeading(Math.atan2(east, north) / deg);
+      const range = Math.hypot(north, east) / 1852;
+      if (range > rangeNm) continue;
+      const angle = angleDifference(ownHeading, bearing) * deg;
+      const x = centerX + Math.sin(angle) * range * pixelsPerNm;
+      const y = centerY - Math.cos(angle) * range * pixelsPerNm;
+      ctx.fillStyle = '#ff4040';
+      ctx.fillRect(x - 2, y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#94ffaf';
+    ctx.fillText('A/A RADAR 30 NM', centerX, centerY - radius - 8);
+    ctx.font = '9px monospace';
+    ctx.fillText('N', centerX, centerY - radius + 11);
+    ctx.fillStyle = '#ffab55';
+    ctx.fillText('BANDIT', centerX - 25, centerY + radius + 18);
+    ctx.fillStyle = '#ff4040';
+    ctx.fillText('MISSILE', centerX + 27, centerY + radius + 18);
+    ctx.restore();
+  }
+
+  function damageAANpcAtWorldPosition(worldPosition, damage = 1, source = 'GUN') {
+    if (!aaSimulation.active || !aaSimulation.npcs.length || !worldPosition) return false;
+    let hitNpc = null;
+    let nearestDistance = AA_NPC_HIT_RADIUS_M;
+    for (const npc of aaSimulation.npcs) {
+      const npcWorld = Cesium.Cartesian3.fromDegrees(npc.lon, npc.lat, npc.alt);
+      const distance = Cesium.Cartesian3.distance(worldPosition, npcWorld);
+      if (distance <= nearestDistance) {
+        nearestDistance = distance;
+        hitNpc = npc;
+      }
+    }
+    if (!hitNpc) return false;
+
+    hitNpc.health -= damage;
+    aaSimulation.hits++;
+    if (hitNpc.health <= 0) {
+      aaSimulation.kills++;
+      const npcId = hitNpc.id;
+      aaSimulation.npcs = aaSimulation.npcs.filter(npc => npc.id !== npcId);
+      missiles = missiles.filter(missile => missile.targetId !== npcId);
+      npcMissiles = npcMissiles.filter(missile => missile.sourceId !== npcId);
+      npcCountermeasures = npcCountermeasures.filter(flare => flare.ownerId !== npcId);
+      if (selectedTargetId === npcId) selectedTargetId = aaSimulation.npcs[0]?.id ?? null;
+      if (lockedTargetId === npcId) lockedTargetId = null;
+      if (!aaSimulation.npcs.length) {
+        stopAASimulation('ALL BANDITS DESTROYED - KILL ' + aaSimulation.kills);
+      } else {
+        toast = { text: hitNpc.callsign + ' DESTROYED - ' + aaSimulation.npcs.length + ' LEFT', until: performance.now() + 2000 };
+        renderGeoFsOptionsCombat();
+      }
+    } else {
+      toast = { text: hitNpc.callsign + ' HIT (' + source + ') - ' + hitNpc.health + ' HIT(S) LEFT', until: performance.now() + 1800 };
+      renderGeoFsOptionsCombat();
+    }
+    return true;
+  }
+
+  function renderGeoFsOptionsCombat() {
+    const container = document.querySelector('.f16eegs-combat-controls');
+    if (!container) return;
+    container.replaceChildren();
+
+    const status = document.createElement('p');
+    status.className = 'f16eegs-combat-status';
+    status.textContent = aaSimulation.active
+      ? aaSimulation.npcs.length + ' BANDIT(S) ACTIVE | DIFFICULTY '
+        + (aaSimulation.npcs[0]?.difficulty ?? selectedAADifficulty) + '/6 | '
+        + aaSimulation.kills + ' KILL(S)'
+      : 'INACTIVE | ' + aaSimulation.kills + ' KILL(S) | ' + aaSimulation.hits + ' HIT(S)';
+    if (aaSimulation.active) {
+      status.textContent += ' | INCOMING: ' + npcMissiles.length
+        + ' | HITS TAKEN: ' + aaSimulation.hitsTaken;
+    }
+    if (multiplayerSync.enabled && multiplayerSync.group) {
+      status.textContent += ' | MP SYNC ' + multiplayerSync.sharedHits + ' HIT(S)';
+    }
+    container.appendChild(status);
+
+    const actions = document.createElement('div');
+    Object.assign(actions.style, { display: 'flex', flexWrap: 'wrap', gap: '8px' });
+    const settings = document.createElement('div');
+    Object.assign(settings.style, {
+      display: 'flex',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      gap: '12px',
+      margin: '8px 0',
+    });
+    const makeSelect = (labelText, value, values, onChange, ariaLabel, formatOption = String) => {
+      const label = document.createElement('label');
+      label.style.display = 'flex';
+      label.style.alignItems = 'center';
+      label.style.gap = '6px';
+      label.textContent = labelText;
+      const select = document.createElement('select');
+      select.setAttribute('aria-label', ariaLabel);
+      for (const optionValue of values) {
+        const option = document.createElement('option');
+        option.value = String(optionValue);
+        option.textContent = formatOption(optionValue);
+        select.appendChild(option);
+      }
+      select.value = String(value);
+      select.addEventListener('change', event => {
+        event.stopPropagation();
+        onChange(Number(select.value));
+      });
+      select.addEventListener('click', event => event.stopPropagation());
+      label.appendChild(select);
+      return label;
+    };
+    settings.append(
+      makeSelect('Difficulty (1 easy - 6 hard)', selectedAADifficulty,
+        [1, 2, 3, 4, 5, 6], value => {
+          selectedAADifficulty = value;
+        }, 'A/A simulation difficulty', value =>
+          value + ' - ' + ['Easy', 'Basic', 'Standard', 'Advanced', 'Expert', 'Hard'][value - 1]),
+      makeSelect('Bandits', selectedAABanditCount,
+        Array.from({ length: 10 }, (_, index) => index + 1), value => {
+          selectedAABanditCount = value;
+        }, 'Number of A/A simulation bandits')
+    );
+    const poiLabel = document.createElement('label');
+    poiLabel.style.display = 'flex';
+    poiLabel.style.alignItems = 'center';
+    poiLabel.style.gap = '6px';
+    const poiCheckbox = document.createElement('input');
+    poiCheckbox.type = 'checkbox';
+    poiCheckbox.checked = showAABanditHudPoi;
+    poiCheckbox.setAttribute('aria-label', 'Show bandit HUD points of interest');
+    poiCheckbox.addEventListener('change', event => {
+      event.stopPropagation();
+      showAABanditHudPoi = poiCheckbox.checked;
+      saveAABanditHudPoiSetting();
+    });
+    poiCheckbox.addEventListener('click', event => event.stopPropagation());
+    poiLabel.append(poiCheckbox, document.createTextNode('Show bandit HUD POI'));
+    settings.appendChild(poiLabel);
+    container.appendChild(settings);
+    const makeButton = (text, label, onClick, disabled = false) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'mdl-button mdl-js-button mdl-button--raised mdl-button--colored';
+      button.textContent = text;
+      button.setAttribute('aria-label', label);
+      button.disabled = disabled;
+      button.addEventListener('click', event => event.stopPropagation());
+      button.addEventListener('click', onClick);
+      return button;
+    };
+    actions.append(
+      makeButton('Start / Restart A/A', 'Start or restart A/A training with the selected difficulty and bandit count',
+        startAASimulation, !ready() || !isF16()),
+      makeButton('Stop Simulation', 'Stop A/A training', () => stopAASimulation(), !aaSimulation.active)
+    );
+    container.appendChild(actions);
+  }
+
+  function renderGeoFsOptionsMultiplayer() {
+    const container = document.querySelector('.f16eegs-mp-controls');
+    if (!container) return;
+    container.replaceChildren();
+    const label = document.createElement('label');
+    Object.assign(label.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      margin: '10px 0 6px',
+    });
+    const enabledInput = document.createElement('input');
+    enabledInput.type = 'checkbox';
+    enabledInput.checked = multiplayerSync.enabled;
+    enabledInput.setAttribute('aria-label', 'Enable multiplayer missile sync');
+    enabledInput.addEventListener('change', () => {
+      multiplayerSync.enabled = enabledInput.checked;
+      saveMultiplayerSyncSettings();
+      if (!multiplayerSync.enabled) networkMissiles = [];
+      toast = {
+        text: 'MULTIPLAYER MISSILE SYNC ' + (multiplayerSync.enabled ? 'ON' : 'OFF'),
+        until: performance.now() + 2000,
+      };
+    });
+    label.append(enabledInput, document.createTextNode('Enable multiplayer missile sync'));
+
+    const groupLabel = document.createElement('label');
+    Object.assign(groupLabel.style, { display: 'flex', alignItems: 'center', gap: '8px' });
+    groupLabel.appendChild(document.createTextNode('Sync group code'));
+    const groupInput = document.createElement('input');
+    groupInput.type = 'text';
+    groupInput.value = multiplayerSync.group;
+    groupInput.maxLength = 16;
+    groupInput.autocomplete = 'off';
+    groupInput.spellcheck = false;
+    groupInput.placeholder = 'share the same 16-character code';
+    groupInput.setAttribute('aria-label', 'Multiplayer missile sync group code');
+    groupInput.addEventListener('change', () => {
+      const value = groupInput.value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+      if (groupInput.value !== value) groupInput.value = value;
+      multiplayerSync.group = value;
+      saveMultiplayerSyncSettings();
+    });
+    groupLabel.appendChild(groupInput);
+
+    const generateKeyButton = document.createElement('button');
+    generateKeyButton.type = 'button';
+    generateKeyButton.textContent = 'Generate Group Code';
+    generateKeyButton.addEventListener('click', () => {
+      multiplayerSync.group = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      groupInput.value = multiplayerSync.group;
+      saveMultiplayerSyncSettings();
+    });
+
+    const testButton = document.createElement('button');
+    testButton.type = 'button';
+    testButton.textContent = 'Send Sync Test';
+    testButton.addEventListener('click', async () => {
+      if (!multiplayerSync.enabled) {
+        toast = { text: 'ENABLE MULTIPLAYER SYNC FIRST', until: performance.now() + 2500 };
+        return;
+      }
+      if (multiplayerSync.group.length < 16) {
+        toast = { text: 'SET A 16-CHARACTER SYNC GROUP CODE', until: performance.now() + 2500 };
+        return;
+      }
+      if (await sendMultiplayerSyncEvent([1, 'T', Date.now()])) {
+        toast = { text: 'SYNC TEST SENT IN PUBLIC GEOFS CHAT', until: performance.now() + 3000 };
+      }
+    });
+
+    const note = document.createElement('p');
+    note.style.margin = '6px 0';
+    note.textContent = 'Both players need the same 16-character group code and updated addon. Lock a radar contact with Enter before launching a missile; Backspace releases flares and reports an evade for synced incoming missiles. Sync messages are plain text in public GeoFS chat; anyone can read them. The group fingerprint only filters messages.';
+    container.append(label, groupLabel, generateKeyButton, testButton, note);
+  }
+
+  async function sendMultiplayerSyncEvent(eventData) {
+    if (!multiplayerSync.enabled || multiplayerSync.group.length < 16) return false;
+    const multiplayer = window.multiplayer;
+    if (typeof multiplayer?.setChatMessage !== 'function') {
+      toast = { text: 'GEOFS CHAT SYNC API UNAVAILABLE', until: performance.now() + 2500 };
+      return false;
+    }
+    try {
+      const message = encodeMultiplayerSyncChatEvent(eventData);
+      if (!message) return false;
+      if (message.length > 70) {
+        toast = { text: 'SYNC EVENT EXCEEDS GEOFS CHAT LIMIT', until: performance.now() + 2500 };
+        return false;
+      }
+      multiplayer.setChatMessage(message);
+      return true;
+    } catch (error) {
+      toast = {
+        text: error.message || 'MULTIPLAYER EVENT COULD NOT BE SENT',
+        until: performance.now() + 3000,
+      };
+      return false;
+    }
+  }
+
+  function encodeMultiplayerSyncChatEvent(eventData) {
+    if (!Array.isArray(eventData)) return '';
+    const prefix = MP_SYNC_CHAT_PREFIX + getMultiplayerSyncGroupFingerprint() + '|';
+    if (eventData[1] === 'T') {
+      return prefix + 'T|' + Date.now().toString(36);
+    }
+    if (eventData[1] === 'L' && eventData[0] === 3) {
+      const [, , missileId, targetId, sentAt] = eventData;
+      if (typeof missileId !== 'string' || typeof targetId !== 'string') return '';
+      const sentAtToken = typeof sentAt === 'string'
+        ? sentAt
+        : Number(sentAt).toString(36);
+      if (!/^[0-9a-z]+$/i.test(sentAtToken)) return '';
+      return prefix + [
+        'L',
+        encodeURIComponent(missileId),
+        encodeURIComponent(targetId),
+        sentAtToken,
+      ].join('|');
+    }
+    if ((eventData[1] === 'H' || eventData[1] === 'X' || eventData[1] === 'D')
+      && eventData.length === 5) {
+      const [, type, missileId, targetId, sentAt] = eventData;
+      if (typeof missileId !== 'string' || typeof targetId !== 'string'
+        || !Number.isFinite(sentAt)) return '';
+      return prefix + [
+        type,
+        encodeURIComponent(missileId),
+        encodeURIComponent(targetId),
+        sentAt.toString(36),
+      ].join('|');
+    }
+    return '';
+  }
+
+  function getMultiplayerSyncGroupFingerprint() {
+    let hash = 2166136261;
+    for (let i = 0; i < multiplayerSync.group.length; i++) {
+      hash ^= multiplayerSync.group.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function parseMultiplayerSyncChatEvent(value) {
+    const fields = value.split('|');
+    const type = fields[0];
+    if (type === 'T' && fields.length === 2) {
+      const sentAt = Number.parseInt(fields[1], 36);
+      return Number.isFinite(sentAt) ? [1, 'T', sentAt] : null;
+    }
+    if (type === 'L' && fields.length === 4) {
+      const sentAt = Number.parseInt(fields[3], 36);
+      if (!Number.isFinite(sentAt)) return null;
+      return [
+        3,
+        'L',
+        decodeURIComponent(fields[1]),
+        decodeURIComponent(fields[2]),
+        sentAt,
+      ];
+    }
+    if ((type === 'H' || type === 'X' || type === 'D') && fields.length === 4) {
+      const sentAt = Number.parseInt(fields[3], 36);
+      if (!Number.isFinite(sentAt)) return null;
+      return [
+        1,
+        type,
+        decodeURIComponent(fields[1]),
+        decodeURIComponent(fields[2]),
+        sentAt,
+      ];
+    }
+    return null;
+  }
+
+  function getMultiplayerUser(userId) {
+    const users = window.multiplayer?.visibleUsers;
+    if (!users || typeof users !== 'object') return null;
+    const id = String(userId);
+    for (const [key, user] of Object.entries(users)) {
+      if ([key, user?.id, user?.uid].some(value => value != null && String(value) === id)) {
+        return user;
+      }
+    }
+    return null;
+  }
+
+  function getMultiplayerUserLabel(userId) {
+    const user = getMultiplayerUser(userId);
+    const label = user?.callsign ?? user?.cs ?? user?.aircraftName ?? user?.username;
+    return label ? String(label).slice(0, 20) : 'PLAYER ' + String(userId).slice(0, 12);
+  }
+
+  function normalizeMultiplayerChatText(value) {
+    let text = String(value ?? '');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const decoded = decodeURIComponent(text.replace(/\+/g, '%20'));
+        if (decoded === text) break;
+        text = decoded;
+      } catch (error) {
+        break;
+      }
+    }
+    return text;
+  }
+
+  async function processMultiplayerSyncChat(message, payload) {
+    if (!multiplayerSync.enabled || multiplayerSync.group.length < 16) return;
+    const senderId = String(message?.uid ?? '');
+    const selfId = String(window.multiplayer?.myId
+      ?? window.multiplayer?.lastResponse?.myId ?? payload?.myId ?? '');
+    if (!senderId || (selfId && senderId === selfId)) return;
+
+    const chatText = normalizeMultiplayerChatText(message?.msg);
+    if (!chatText.startsWith(MP_SYNC_CHAT_PREFIX)) return;
+    const groupSeparator = chatText.indexOf('|', MP_SYNC_CHAT_PREFIX.length);
+    if (groupSeparator < 0) return;
+    const group = chatText.slice(MP_SYNC_CHAT_PREFIX.length, groupSeparator);
+    if (group !== getMultiplayerSyncGroupFingerprint()) return;
+    const messageKey = senderId + ':' + chatText;
+    if (seenMultiplayerChatMessages.has(messageKey)) return;
+    seenMultiplayerChatMessages.add(messageKey);
+    if (seenMultiplayerChatMessages.size > 500) {
+      seenMultiplayerChatMessages.delete(seenMultiplayerChatMessages.values().next().value);
+    }
+
+    try {
+      const data = parseMultiplayerSyncChatEvent(chatText.slice(groupSeparator + 1));
+      if (!data) throw new Error('Malformed sync event');
+      processMultiplayerSyncEvent(data, senderId, selfId);
+    } catch (error) {
+      toast = {
+        text: 'INVALID SYNC CHAT MESSAGE (' + chatText.length + ' CHARS)',
+        until: performance.now() + 3000,
+      };
+    }
+  }
+
+  async function onMultiplayerUpdate(payload) {
+    const messages = Array.isArray(payload?.chatMessages) ? payload.chatMessages : [];
+    for (const message of messages) await processMultiplayerSyncChat(message, payload);
+  }
+
+  function ensureMultiplayerSyncHook() {
+    const multiplayer = window.multiplayer;
+    if (!multiplayer || typeof multiplayer.updateCallback !== 'function') return false;
+    if (multiplayer.updateCallback === wrappedMultiplayerUpdate) return true;
+
+    originalMultiplayerUpdate = multiplayer.updateCallback;
+    wrappedMultiplayerUpdate = function (payload) {
+      void onMultiplayerUpdate(payload);
+      return originalMultiplayerUpdate.apply(this, arguments);
+    };
+    multiplayer.updateCallback = wrappedMultiplayerUpdate;
+    return true;
+  }
+
+  function processMultiplayerSyncEvent(data, senderId, selfIdOverride) {
+    if (!multiplayerSync.enabled || !Array.isArray(data)) return;
+    const selfId = selfIdOverride ?? String(window.multiplayer?.myId
+      ?? window.multiplayer?.lastResponse?.myId ?? '');
+    if (data[0] !== 1 && data[0] !== 2 && data[0] !== 3) return;
+
+    if (data[1] === 'T') {
+      toast = {
+        text: 'MULTIPLAYER SYNC TEST RECEIVED',
+        until: performance.now() + 3000,
+      };
+      return;
+    }
+
+    if (data[1] === 'L') {
+      if (data[0] === 3) {
+        const [, , missileId, targetId, sentAt] = data;
+        if (String(targetId) !== selfId || !selfId || typeof missileId !== 'string'
+          || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+        const key = senderId + ':' + missileId;
+        if (receivedNetworkEvents.has('L:' + key)) return;
+        const sender = getMultiplayerUser(senderId);
+        const coordinates = sender?.lastUpdate?.co;
+        const own = geofs.aircraft.instance?.llaLocation;
+        if (!Array.isArray(coordinates) || coordinates.length < 3
+          || !Array.isArray(own) || own.length < 3) return;
+        const [lat, lon, altitude] = coordinates.map(Number);
+        if (![lat, lon, altitude].every(Number.isFinite)) return;
+        const position = Cesium.Cartesian3.fromDegrees(lon, lat, altitude);
+        const targetPosition = Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]);
+        const direction = Cesium.Cartesian3.subtract(
+          targetPosition, position, new Cesium.Cartesian3());
+        const distance = Cesium.Cartesian3.magnitude(direction);
+        if (!Number.isFinite(distance) || distance <= 0) return;
+        Cesium.Cartesian3.normalize(direction, direction);
+        Cesium.Cartesian3.multiplyByScalar(direction, 900, direction);
+        receivedNetworkEvents.add('L:' + key);
+        if (receivedNetworkEvents.size > 500) {
+          receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+        }
+        networkMissiles.push({
+          key,
+          senderId,
+          missileId,
+          position,
+          lastTargetWorld: null,
+          velocity: [direction.x, direction.y, direction.z],
+          speed: 900,
+          turnRate: 1.2,
+          maxFlightTime: Math.min(240, Math.max(8, distance / 700 + 10)),
+          t0: performance.now(),
+          updatedAt: performance.now(),
+          trail: [],
+        });
+        if (networkMissiles.length > 32) networkMissiles.shift();
+        toast = {
+          text: 'MISSILE LAUNCHED BY ' + getMultiplayerUserLabel(senderId),
+          until: performance.now() + 2500,
+        };
+        return;
+      }
+      const compact = data[0] === 2;
+      const [, , missileId, targetId, rawPosition, rawVelocity, speedOrFlightTime,
+        turnRateOrSentAt, maxFlightTime, sentAt] = data;
+      const position = compact ? rawPosition?.map(value => value * 10) : rawPosition;
+      const velocity = compact ? rawVelocity?.map(value => value * 10) : rawVelocity;
+      const speed = compact ? 900 : speedOrFlightTime;
+      const turnRate = compact ? 1.2 : turnRateOrSentAt;
+      const compactSentAt = compact ? Number.parseInt(String(turnRateOrSentAt), 36) : sentAt;
+      const flightTime = compact ? speedOrFlightTime : maxFlightTime;
+      if (String(targetId) !== selfId || !selfId || typeof missileId !== 'string'
+        || !Array.isArray(position) || !Array.isArray(velocity)
+        || position.length !== 3 || velocity.length !== 3
+        || !position.every(Number.isFinite) || !velocity.every(Number.isFinite)
+        || !Number.isFinite(speed) || speed < 200 || speed > 1500
+        || !Number.isFinite(turnRate) || turnRate < 0.1 || turnRate > 3
+        || !Number.isFinite(flightTime) || flightTime < 1 || flightTime > 240
+        || !Number.isFinite(compactSentAt) || Math.abs(Date.now() - compactSentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      if (receivedNetworkEvents.has('L:' + key)) return;
+      receivedNetworkEvents.add('L:' + key);
+      if (receivedNetworkEvents.size > 500) {
+        receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+      }
+      networkMissiles.push({
+        key,
+        senderId,
+        missileId,
+        position: new Cesium.Cartesian3(position[0], position[1], position[2]),
+        lastTargetWorld: null,
+        velocity,
+        speed,
+        turnRate,
+        maxFlightTime: flightTime,
+        t0: performance.now(),
+        updatedAt: performance.now(),
+        trail: [],
+      });
+      if (networkMissiles.length > 32) networkMissiles.shift();
+      toast = {
+        text: 'MISSILE LAUNCHED BY ' + getMultiplayerUserLabel(senderId),
+        until: performance.now() + 2500,
+      };
+      return;
+    }
+
+    if (data[1] === 'H') {
+      const [, , missileId, targetId, sentAt] = data;
+      if (String(targetId) !== selfId || typeof missileId !== 'string'
+        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      if (receivedNetworkEvents.has('D:' + key)) return;
+      if (receivedNetworkEvents.has('H:' + key)) return;
+      receivedNetworkEvents.add('H:' + key);
+      if (receivedNetworkEvents.size > 500) {
+        receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+      }
+      networkMissiles = networkMissiles.filter(missile => missile.key !== key);
+      multiplayerSync.sharedHits++;
+      const own = geofs.aircraft.instance?.llaLocation;
+      if (Array.isArray(own) && own.length >= 3) {
+        impacts.push({
+          pos: Cesium.Cartesian3.fromDegrees(own[1], own[0], own[2]),
+          t0: performance.now(),
+        });
+      }
+      toast = {
+        text: 'MISSILE HIT FROM ' + getMultiplayerUserLabel(senderId),
+        until: performance.now() + 3500,
+      };
+      return;
+    }
+
+    if (data[1] === 'D') {
+      const [, , missileId, targetId, sentAt] = data;
+      if (String(targetId) !== selfId || typeof missileId !== 'string'
+        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      const evadeEventKey = 'D:' + key;
+      if (receivedNetworkEvents.has(evadeEventKey)) return;
+      const missile = missiles.find(item =>
+        item.networkId === missileId && String(item.targetId) === senderId);
+      if (!missile) return;
+      receivedNetworkEvents.add(evadeEventKey);
+      if (receivedNetworkEvents.size > 500) {
+        receivedNetworkEvents.delete(receivedNetworkEvents.values().next().value);
+      }
+      missiles = missiles.filter(item => item !== missile);
+      const missilePosition = worldPosition(missile.enuMat, missile.position);
+      impacts.push({ pos: missilePosition, t0: performance.now() });
+      toast = {
+        text: getMultiplayerUserLabel(senderId) + ' EVADED MISSILE WITH FLARES',
+        until: performance.now() + 3000,
+      };
+      return;
+    }
+
+    if (data[1] === 'X') {
+      const [, , missileId, targetId, sentAt] = data;
+      if (String(targetId) !== selfId || typeof missileId !== 'string'
+        || !Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 15000) return;
+      const key = senderId + ':' + missileId;
+      networkMissiles = networkMissiles.filter(missile => missile.key !== key);
+    }
+  }
+
+  function getRadarTargets() {
+    const own = geofs.aircraft.instance.llaLocation;
+    if (!own) return [];
+    const ownHeading = Number(geofs.animation.values.heading360 || geofs.animation.values.heading) || 0;
+    const rangeLimit = RADAR_RANGE_NM * 1852;
+    const targets = [];
+
+    for (const user of Object.values(window.multiplayer?.visibleUsers ?? {})) {
+      const co = user && user.lastUpdate && user.lastUpdate.co;
+      if (!Array.isArray(co) || co.length < 3) continue;
+      const lat = Number(co[0]), lon = Number(co[1]), alt = Number(co[2]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(alt)) continue;
+
+      const dLat = (lat - own[0]) * deg;
+      const dLon = (lon - own[1]) * deg;
+      const lat1 = own[0] * deg, lat2 = lat * deg;
+      const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      const groundDistance = 2 * R_EARTH * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      const distance = Math.hypot(groundDistance, alt - own[2]);
+      if (!Number.isFinite(distance) || distance < 50 || distance > rangeLimit) continue;
+
+      const y = Math.sin(dLon) * Math.cos(lat2);
+      const x = Math.cos(lat1) * Math.sin(lat2) -
+        Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+      const bearing = (Math.atan2(y, x) / deg + 360) % 360;
+      const id = String(user.id ?? user.uid ?? user.callsign ?? user.cs ?? '');
+      if (!id) continue;
+      targets.push({
+        id,
+        callsign: String(user.callsign ?? user.cs ?? user.aircraftName ?? 'CONTACT'),
+        lat, lon, alt, bearing,
+        rangeNm: distance / 1852,
+        relativeBearing: ((bearing - ownHeading + 540) % 360) - 180,
+      });
+    }
+
+    for (const npc of aaSimulation.active ? aaSimulation.npcs : []) {
+      const dLat = (npc.lat - own[0]) * deg;
+      const dLon = (npc.lon - own[1]) * deg;
+      const lat1 = own[0] * deg;
+      const lat2 = npc.lat * deg;
+      const a = Math.sin(dLat / 2) ** 2
+        + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      const groundDistance = 2 * R_EARTH * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      const distance = Math.hypot(groundDistance, npc.alt - own[2]);
+      const y = Math.sin(dLon) * Math.cos(lat2);
+      const x = Math.cos(lat1) * Math.sin(lat2)
+        - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+      const bearing = normalizeHeading(Math.atan2(y, x) / deg);
+      if (Number.isFinite(distance) && distance >= 50 && distance <= rangeLimit) {
+        targets.push({
+          id: npc.id,
+          callsign: npc.callsign,
+          lat: npc.lat,
+          lon: npc.lon,
+          alt: npc.alt,
+          bearing,
+          rangeNm: distance / 1852,
+          relativeBearing: ((bearing - ownHeading + 540) % 360) - 180,
+          isNpc: true,
+          health: npc.health,
+          difficulty: npc.difficulty
+        });
+      }
+    }
+
+    targets.sort((a, b) => a.rangeNm - b.rangeNm);
+    return targets;
+  }
+
+  function selectTarget(step) {
+    if (!currentTargets.length) {
+      selectedTargetId = null;
+      lockedTargetId = null;
+      toast = { text: 'RADAR: NO CONTACTS', until: performance.now() + 1500 };
+      return;
+    }
+    const index = currentTargets.findIndex(target => target.id === selectedTargetId);
+    const next = index < 0
+      ? (step > 0 ? 0 : currentTargets.length - 1)
+      : (index + step + currentTargets.length) % currentTargets.length;
+    selectedTargetId = currentTargets[next].id;
+    lockedTargetId = null;
+    const target = currentTargets[next];
+    toast = { text: 'TARGET: ' + target.callsign, until: performance.now() + 1500 };
+  }
+
+  function drawHudTarget(scene, target, bounds) {
+    if (!target) return;
+    const world = Cesium.Cartesian3.fromDegrees(target.lon, target.lat, target.alt);
+    const project = Cesium.SceneTransforms.worldToWindowCoordinates ||
+      Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const point = project.call(Cesium.SceneTransforms, scene, world);
+    if (!point) return;
+
+    const rect = scene.canvas.getBoundingClientRect();
+    const scale = rect.width / scene.canvas.clientWidth || 1;
+    const x = rect.left + point.x * scale + CFG.hudOffset.x;
+    const y = rect.top + point.y * scale + CFG.hudOffset.y;
+    if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return;
+
+    const size = 22;
+    const half = size / 2;
+    const color = target.id === lockedTargetId ? '#ff5959' : CFG.color;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 5;
+    ctx.strokeRect(x - half, y - half, size, size);
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(target.callsign.slice(0, 14), x + half + 4, y - 2);
+    ctx.textBaseline = 'top';
+    ctx.fillText(target.rangeNm.toFixed(1) + ' NM', x + half + 4, y + 2);
+    ctx.restore();
+  }
+
+  function drawAANpcHudTargets(scene) {
+    if (!aaSimulation.active || !showAABanditHudPoi) return;
+    const targets = currentTargets.filter(target => target.isNpc);
+    if (!targets.length) return;
+
+    const camera = scene.camera;
+    const cameraPosition = camera.positionWC;
+    const cameraDirection = camera.directionWC;
+    const project = Cesium.SceneTransforms.worldToWindowCoordinates
+      || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const rect = scene.canvas.getBoundingClientRect();
+    const scaleX = rect.width / scene.canvas.clientWidth || 1;
+    const scaleY = rect.height / scene.canvas.clientHeight || 1;
+    const margin = 28;
+    const centerX = innerWidth / 2;
+    const centerY = innerHeight / 2;
+
+    ctx.save();
+    ctx.font = 'bold 12px monospace';
+    ctx.textBaseline = 'middle';
+    for (const target of targets) {
+      const world = Cesium.Cartesian3.fromDegrees(target.lon, target.lat, target.alt);
+      const point = project.call(Cesium.SceneTransforms, scene, world);
+      const toTarget = Cesium.Cartesian3.subtract(
+        world, cameraPosition, new Cesium.Cartesian3());
+      const inFront = Cesium.Cartesian3.dot(toTarget, cameraDirection) > 0;
+      let x, y, onScreen = false;
+
+      if (point && inFront) {
+        x = rect.left + point.x * scaleX + CFG.hudOffset.x;
+        y = rect.top + point.y * scaleY + CFG.hudOffset.y;
+        onScreen = x >= margin && x <= innerWidth - margin
+          && y >= margin && y <= innerHeight - margin;
+      }
+
+      if (!onScreen) {
+        let directionX, directionY;
+        if (point && inFront) {
+          directionX = x - centerX;
+          directionY = y - centerY;
+        } else {
+          const bearing = target.relativeBearing * deg;
+          directionX = Math.sin(bearing);
+          directionY = -Math.cos(bearing);
+        }
+        const length = Math.hypot(directionX, directionY) || 1;
+        directionX /= length;
+        directionY /= length;
+        const edgeX = innerWidth / 2 - margin;
+        const edgeY = innerHeight / 2 - margin;
+        const edgeScale = Math.min(
+          edgeX / Math.max(Math.abs(directionX), 0.001),
+          edgeY / Math.max(Math.abs(directionY), 0.001)
+        );
+        x = centerX + directionX * edgeScale;
+        y = centerY + directionY * edgeScale;
+      }
+
+      const selected = target.id === selectedTargetId;
+      const color = selected ? '#ffffff' : '#ffab55';
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 7;
+      ctx.lineWidth = selected ? 2.5 : 1.5;
+      if (onScreen) {
+        const size = selected ? 24 : 18;
+        ctx.strokeRect(x - size / 2, y - size / 2, size, size);
+      } else {
+        const angle = Math.atan2(y - centerY, x - centerX);
+        ctx.translate(x, y);
+        ctx.rotate(angle + Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(0, -9);
+        ctx.lineTo(7, 7);
+        ctx.lineTo(-7, 7);
+        ctx.closePath();
+        ctx.fill();
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      const labelX = Math.min(x + 14, innerWidth - 140);
+      const labelY = Math.max(margin + 5, Math.min(y, innerHeight - margin - 5));
+      ctx.textAlign = labelX > innerWidth - 150 ? 'right' : 'left';
+      ctx.fillText(
+        target.callsign + ' ' + target.rangeNm.toFixed(1) + 'NM',
+        ctx.textAlign === 'right' ? Math.max(margin + 5, x - 14) : labelX,
+        labelY
+      );
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function releaseCountermeasures() {
+    if (!ready()) return;
+    const now = performance.now();
+    const lla = geofs.aircraft.instance.llaLocation;
+    if (!lla) return;
+    const origin = Cesium.Transforms.eastNorthUpToFixedFrame(
+      Cesium.Cartesian3.fromDegrees(lla[1], lla[0], lla[2]));
+    const axes = bodyAxes();
+    const invOrigin = Cesium.Matrix4.inverseTransformation(origin, new Cesium.Matrix4());
+    const sequence = ++countermeasureSequence;
+    for (let i = 0; i < 18; i++) {
+      const lateral = (Math.random() - 0.5) * 8;
+      countermeasures.push({
+        type: 'chaff', t0: now, life: 2.2, sequence,
+        origin, invOrigin,
+        offset: add(mul(axes[0], -7), mul(axes[1], lateral)),
+        velocity: add(mul(axes[0], -12 - Math.random() * 8),
+          mul(axes[1], (Math.random() - 0.5) * 12)),
+        size: 1 + Math.random() * 1.5,
+      });
+    }
+    for (let i = 0; i < 3; i++) {
+      countermeasures.push({
+        type: 'flare', t0: now, life: 1.8, sequence,
+        origin, invOrigin,
+        offset: add(mul(axes[0], -7), mul(axes[1], (Math.random() - 0.5) * 5)),
+        velocity: add(mul(axes[0], -18 - Math.random() * 8),
+          [0, 0, -3 - Math.random() * 4]),
+        size: 3 + Math.random() * 2,
+      });
+    }
+    const incomingMissiles = networkMissiles.filter(missile =>
+      now - missile.t0 < missile.maxFlightTime * 1000);
+    const selfId = String(window.multiplayer?.myId
+      ?? window.multiplayer?.lastResponse?.myId ?? '');
+    const evadeSends = incomingMissiles.map(missile => {
+      receivedNetworkEvents.add('D:' + missile.key);
+      if (!multiplayerSync.enabled || !selfId) return Promise.resolve(false);
+      return sendMultiplayerSyncEvent([
+        1,
+        'D',
+        missile.missileId,
+        selfId,
+        Date.now(),
+      ]);
+    });
+    if (incomingMissiles.length) {
+      networkMissiles = networkMissiles.filter(missile => !incomingMissiles.includes(missile));
+    }
+    countermeasureSound();
+    if (!incomingMissiles.length) {
+      toast = { text: 'CHAFF / FLARE RELEASED', until: now + 1500 };
+      return;
+    }
+    toast = { text: 'FLARES RELEASED - REPORTING MISSILE EVADE', until: now + 2000 };
+    void Promise.all(evadeSends).then(results => {
+      const sentCount = results.filter(Boolean).length;
+      toast = {
+        text: sentCount === incomingMissiles.length
+          ? 'FLARES RELEASED - MISSILE EVADE SENT'
+          : 'FLARES RELEASED - EVADE MESSAGE NOT SENT',
+        until: performance.now() + 2000,
+      };
+    });
+  }
+
+  function drawCountermeasures(scene) {
+    const now = performance.now();
+    countermeasures = countermeasures.filter(p => now - p.t0 < p.life);
+    if (!countermeasures.length) return;
+    const lla = geofs.aircraft.instance.llaLocation;
+    if (!lla) return;
+    const fn = Cesium.SceneTransforms.worldToWindowCoordinates ||
+      Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const rect = scene.canvas.getBoundingClientRect();
+    const aircraftWorld = Cesium.Cartesian3.fromDegrees(lla[1], lla[0], lla[2]);
+    ctx.save();
+    for (const p of countermeasures) {
+      const age = (now - p.t0) / 1000;
+      const alpha = 1 - age / p.life;
+      const aircraftPosition = Cesium.Matrix4.multiplyByPoint(
+        p.invOrigin, aircraftWorld, new Cesium.Cartesian3());
+      const offset = add(aircraftPosition,
+        add(p.offset, add(mul(p.velocity, age), [0, 0, -4.905 * age * age])));
+      const world = Cesium.Matrix4.multiplyByPoint(
+        p.origin, new Cesium.Cartesian3(offset[0], offset[1], offset[2]), new Cesium.Cartesian3());
+      const screen = fn.call(Cesium.SceneTransforms, scene, world);
+      if (!screen) continue;
+      const x = rect.left + screen.x, y = rect.top + screen.y;
+      ctx.globalAlpha = alpha;
+      if (p.type === 'flare') {
+        ctx.fillStyle = '#ffd26a';
+        ctx.shadowColor = '#ff5a18';
+        ctx.shadowBlur = 22;
+        ctx.beginPath();
+        ctx.arc(x, y, p.size * (1 - age / p.life * 0.35) + 3, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = '#e7edf2';
+        ctx.shadowColor = '#d8e4ef';
+        ctx.shadowBlur = 8;
+        ctx.fillRect(x, y, p.size + 2, p.size + 1);
+      }
+    }
+    ctx.restore();
+  }
+
+
+  function cameraAxes() {
+    const cam = geofs.api.viewer.scene.camera;
+    const inv = Cesium.Matrix4.inverseTransformation(
+      Cesium.Transforms.eastNorthUpToFixedFrame(cam.positionWC), new Cesium.Matrix4());
+    const enu = (c) => {
+      const o = Cesium.Matrix4.multiplyByPointAsVector(inv, c, new Cesium.Cartesian3());
+      return [o.x, o.y, o.z];
+    };
+    return [enu(cam.directionWC), enu(cam.rightWC), mul(enu(cam.upWC), -1)];
+  }
+
+  function aircraftAxes(hs, ps, rs) {
+    const v = geofs.animation.values;
+    const h = (v.heading360 || 0) * deg * hs;
+    const p = (v.atilt || 0) * deg * ps;
+    const r = (v.aroll || 0) * deg * rs;
+    const fwd = [Math.sin(h) * Math.cos(p), Math.cos(h) * Math.cos(p), Math.sin(p)];
+    const right0 = [Math.cos(h), -Math.sin(h), 0];
+    const up0 = cross(right0, fwd);
+    const c = Math.cos(r), s = Math.sin(r);
+    const right = add(mul(right0, c), mul(up0, -s));
+    const up = add(mul(right0, s), mul(up0, c));
+    return [fwd, right, mul(up, -1)];
+  }
+
+  const COMBOS = [];
+  for (const hs of [1, -1]) for (const ps of [1, -1]) for (const rs of [1, -1]) COMBOS.push([hs, ps, rs]);
+  const scores = COMBOS.map(() => 0);
+  let best = 0;
+
+  function bodyAxes() {
+    const cam = cameraAxes();
+    if (CFG.orientationSource === 'camera') return cam;
+    const all = COMBOS.map(c => aircraftAxes(c[0], c[1], c[2]));
+    if (inCockpit()) {
+      for (let i = 0; i < all.length; i++) {
+        const m = dot(all[i][0], cam[0]) + dot(all[i][1], cam[1]) + dot(all[i][2], cam[2]);
+        scores[i] = scores[i] * 0.99 + m;
+      }
+      for (let i = 0; i < scores.length; i++) if (scores[i] > scores[best] + 3) best = i;
+    }
+    return all[best];
+  }
+
+
+  function updateMotion(axes) {
+    const lla = geofs.aircraft.instance.llaLocation;
+    const now = performance.now();
+    const dt = (now - lastT) / 1000;
+    const reportedG = geofs.animation?.values?.loadFactor;
+    const hasReportedG = Number.isFinite(reportedG) && Math.abs(reportedG) < 100;
+    if (hasReportedG) {
+      gLoad = Math.max(0, reportedG);
+    }
+    if (lla && lastPos && dt > 0.001 && dt < 0.5) {
+      const a = Math.min(1, dt * 8);
+      const n = (lla[0] - lastPos[0]) * deg * R_EARTH / dt;
+      const e = (lla[1] - lastPos[1]) * deg * R_EARTH * Math.cos(lla[0] * deg) / dt;
+      const u = (lla[2] - lastPos[2]) / dt;
+      const measuredVelocity = [e, n, u];
+      if (Math.hypot(...measuredVelocity) < 1500) {
+        vel[0] += (e - vel[0]) * a;
+        vel[1] += (n - vel[1]) * a;
+        vel[2] += (u - vel[2]) * a;
+        if (!hasReportedG && lastMeasuredVelocity) {
+          const specificForce = [
+            (e - lastMeasuredVelocity[0]) / dt,
+            (n - lastMeasuredVelocity[1]) / dt,
+            (u - lastMeasuredVelocity[2]) / dt + 9.81,
+          ];
+          const upAxis = mul(axes[2], -1);
+          const measuredG = Math.max(0, dot(specificForce, upAxis) / 9.81);
+          gLoad += (measuredG - gLoad) * Math.min(1, dt * 4);
+        }
+        lastMeasuredVelocity = measuredVelocity;
+      } else {
+        lastMeasuredVelocity = null;
+      }
+      if (gLoad >= GLOC_DETECTION_THRESHOLD && !gPassedOut) {
+        gLoadTime += dt;
+        if (gLoadTime >= GLOC_TIME_TO_PASS_OUT) {
+          gPassedOut = true;
+          gRecoveryRemaining = GLOC_RECOVERY_TIME;
+          toast = { text: 'G-LOC - PILOT PASSED OUT', until: now + 3000 };
+        }
+      } else if (gPassedOut) {
+        if (gLoad >= GLOC_DETECTION_THRESHOLD) {
+          gRecoveryRemaining = GLOC_RECOVERY_TIME;
+        } else {
+          gRecoveryRemaining = Math.max(0, gRecoveryRemaining - dt);
+          if (gRecoveryRemaining === 0) {
+            gPassedOut = false;
+            gLoadTime = 0;
+          }
+        }
+      } else {
+        gLoadTime = 0;
+      }
+      if (prevAxes) {
+        const d = (i, j) => dot(prevAxes[i], axes[j]);
+        const w = [(d(2, 1) - d(1, 2)) / (2 * dt),
+                   (d(0, 2) - d(2, 0)) / (2 * dt),
+                   (d(1, 0) - d(0, 1)) / (2 * dt)];
+        if (Math.hypot(w[0], w[1], w[2]) < 4) {
+          const b = Math.min(1, dt * 6);
+          for (let i = 0; i < 3; i++) omega[i] += (w[i] - omega[i]) * b;
+        }
+      }
+    }
+    lastPos = lla ? lla.slice() : null;
+    lastT = now;
+    prevAxes = axes;
+  }
+
+  function getGForceVisualSeverity() {
+    const loadSeverity = Math.max(0, Math.min(1,
+      (gLoad - 2) / (GLOC_THRESHOLD - 2))) * 0.65;
+    const exposureSeverity = Math.min(1, gLoadTime / GLOC_TIME_TO_PASS_OUT);
+    const recoverySeverity = gPassedOut
+      ? gLoad >= GLOC_DETECTION_THRESHOLD
+        ? 1
+        : gRecoveryRemaining / GLOC_RECOVERY_TIME
+      : 0;
+    return Math.max(loadSeverity, exposureSeverity * 0.9, recoverySeverity);
+  }
+
+  function applyGForceFilter(scene) {
+    const targetCanvas = scene.canvas;
+    if (gEffectCanvas !== targetCanvas) {
+      if (gEffectCanvas) gEffectCanvas.style.filter = gEffectBaseFilter;
+      gEffectCanvas = targetCanvas;
+      gEffectBaseFilter = targetCanvas.style.filter || '';
+    }
+
+    const severity = getGForceVisualSeverity();
+    if (!severity) {
+      targetCanvas.style.filter = gEffectBaseFilter;
+      return;
+    }
+    const filters = [
+      gEffectBaseFilter,
+      'grayscale(' + Math.min(1, severity * 1.2) + ')',
+      'contrast(' + (1 + severity * 1.2) + ')',
+      'brightness(' + (1 - severity * 0.42) + ')',
+    ].filter(Boolean);
+    targetCanvas.style.filter = filters.join(' ');
+  }
+
+  function drawGForceOverlay() {
+    const severity = getGForceVisualSeverity();
+    ctx.save();
+    const centerX = innerWidth / 2;
+    const centerY = innerHeight / 2;
+    if (severity > 0) {
+      const vignette = ctx.createRadialGradient(
+        centerX, centerY, Math.min(innerWidth, innerHeight) * 0.18,
+        centerX, centerY, Math.max(innerWidth, innerHeight) * 0.72
+      );
+      vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      vignette.addColorStop(1, 'rgba(0, 0, 0, ' + Math.min(0.99, severity * 1.2) + ')');
+      ctx.fillStyle = vignette;
+      ctx.fillRect(0, 0, innerWidth, innerHeight);
+    }
+
+    if (gPassedOut) {
+      const blackout = gLoad >= GLOC_DETECTION_THRESHOLD
+        ? 0.995
+        : Math.min(0.995, 0.98 * gRecoveryRemaining / GLOC_RECOVERY_TIME);
+      ctx.globalAlpha = blackout;
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, innerWidth, innerHeight);
+    }
+
+    if (gPassedOut) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText('G-LOC - RECOVERING', centerX, Math.max(28, centerY));
+    }
+    ctx.restore();
+  }
+
+  function inRotatedFrame(v, t) {
+    const m = Math.hypot(omega[0], omega[1], omega[2]);
+    const th = m * t;
+    if (th < 1e-6) return v;
+    const k = [omega[0] / m, omega[1] / m, omega[2] / m];
+    const c = Math.cos(th), s = Math.sin(th);
+    const kxv = cross(k, v), kdv = dot(k, v);
+    return [v[0] * c - kxv[0] * s + k[0] * kdv * (1 - c),
+            v[1] * c - kxv[1] * s + k[1] * kdv * (1 - c),
+            v[2] * c - kxv[2] * s + k[2] * kdv * (1 - c)];
+  }
+
+
+  function toScreen(enuMat, scene, p, raw) {
+    const w = Cesium.Matrix4.multiplyByPoint(enuMat, new Cesium.Cartesian3(p[0], p[1], p[2]), new Cesium.Cartesian3());
+    const fn = Cesium.SceneTransforms.worldToWindowCoordinates || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+    const s = fn.call(Cesium.SceneTransforms, scene, w);
+    if (!s) return null;
+    const rect = scene.canvas.getBoundingClientRect();
+    const k = rect.width / scene.canvas.clientWidth || 1;
+    const ox = raw ? 0 : CFG.hudOffset.x, oy = raw ? 0 : CFG.hudOffset.y;
+    return { x: rect.left + s.x * k + ox, y: rect.top + s.y * k + oy };
+  }
+
+  function worldPosition(enuMat, p) {
+    return Cesium.Matrix4.multiplyByPoint(
+      enuMat, new Cesium.Cartesian3(p[0], p[1], p[2]), new Cesium.Cartesian3());
+  }
+
+  function turnVelocity(velocity, desired, maxAngle) {
+    const speed = Math.hypot(velocity[0], velocity[1], velocity[2]);
+    const desiredSpeed = Math.hypot(desired[0], desired[1], desired[2]);
+    if (speed < 1e-6 || desiredSpeed < 1e-6) return velocity;
+
+    const current = mul(velocity, 1 / speed);
+    const target = mul(desired, 1 / desiredSpeed);
+    const cosine = Math.max(-1, Math.min(1, dot(current, target)));
+    const angle = Math.acos(cosine);
+    if (angle < 1e-6) return mul(target, speed);
+
+    const axisVector = cross(current, target);
+    const axisLength = Math.hypot(axisVector[0], axisVector[1], axisVector[2]);
+    let axis;
+    if (axisLength < 1e-6) {
+      axis = cross(current, Math.abs(current[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]);
+      const length = Math.hypot(axis[0], axis[1], axis[2]);
+      axis = mul(axis, 1 / length);
+    } else {
+      axis = mul(axisVector, 1 / axisLength);
+    }
+
+    const turn = Math.min(angle, maxAngle);
+    const c = Math.cos(turn), s = Math.sin(turn);
+    const rotated = add(add(mul(current, c), mul(cross(axis, current), s)),
+      mul(axis, dot(axis, current) * (1 - c)));
+    return mul(rotated, speed);
+  }
+
+
+
+
+  let actx = null, gunBuf = null, gunFilter = null, gunGain = null, gunSrc = null, soundOn = false;
+
+  function initAudio() {
+    if (actx || !CFG.sound) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    actx = new AC();
+    const sr = actx.sampleRate;
+    const period = Math.round(sr / CFG.fireRate);          
+    const rounds = 60;
+    const len = period * rounds;
+    gunBuf = actx.createBuffer(1, len, sr);
+    const d = gunBuf.getChannelData(0);
+    for (let r = 0; r < rounds; r++) {
+      const amp = 0.8 + 0.2 * Math.random();
+      const start = r * period;
+      for (let n = 0; n < period * 2; n++) {
+        const t = n / sr;
+        const crack = (Math.random() * 2 - 1) * Math.exp(-t / 0.0012);      
+        const thump = Math.sin(2 * Math.PI * 70 * t) * Math.exp(-t / 0.0055); 
+        d[(start + n) % len] += amp * (0.55 * crack + 0.9 * thump);
+      }
+    }
+    let peak = 0;
+    for (let i = 0; i < len; i++) peak = Math.max(peak, Math.abs(d[i]));
+    for (let i = 0; i < len; i++) d[i] /= (peak || 1);
+
+    gunFilter = actx.createBiquadFilter();                  
+    gunFilter.type = 'lowpass';
+    gunFilter.frequency.value = 3200;
+    gunGain = actx.createGain();
+    gunGain.gain.value = 0.0001;
+    const comp = actx.createDynamicsCompressor();
+    gunFilter.connect(gunGain);
+    gunGain.connect(comp);
+    comp.connect(actx.destination);
+  }
+
+  function gunSound(on) {
+    if (!actx || !gunBuf) return;
+    const t = actx.currentTime;
+    if (on && !soundOn) {
+      soundOn = true;
+      if (actx.state === 'suspended') actx.resume();
+      gunSrc = actx.createBufferSource();
+      gunSrc.buffer = gunBuf;
+      gunSrc.loop = true;
+      gunSrc.playbackRate.setValueAtTime(0.55, t);                   
+      gunSrc.playbackRate.linearRampToValueAtTime(1, t + 0.25);
+      gunSrc.connect(gunFilter);
+      gunGain.gain.cancelScheduledValues(t);
+      gunGain.gain.setValueAtTime(0.0001, t);
+      gunGain.gain.linearRampToValueAtTime(CFG.gunVolume, t + 0.04);
+      gunSrc.start(t);
+    } else if (!on && soundOn) {
+      soundOn = false;
+      const src = gunSrc;
+      gunGain.gain.cancelScheduledValues(t);
+      gunGain.gain.setValueAtTime(Math.max(0.0001, gunGain.gain.value), t);
+      gunGain.gain.linearRampToValueAtTime(0.0001, t + 0.2);         
+      src.playbackRate.cancelScheduledValues(t);
+      src.playbackRate.setValueAtTime(src.playbackRate.value, t);
+      src.playbackRate.linearRampToValueAtTime(0.45, t + 0.2);
+      src.stop(t + 0.22);
+    }
+  }
+
+  function dryClick() {
+    if (!actx || !CFG.sound) return;
+    const sr = actx.sampleRate, n = Math.round(sr * 0.03);
+    const b = actx.createBuffer(1, n, sr), d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (sr * 0.004));
+    const src = actx.createBufferSource(), g = actx.createGain(), f = actx.createBiquadFilter();
+    f.type = 'bandpass'; f.frequency.value = 1800;
+    g.gain.value = CFG.gunVolume * 0.6;
+    src.buffer = b;
+    src.connect(f); f.connect(g); g.connect(actx.destination);
+    src.start();
+  }
+
+  function countermeasureSound() {
+    if (!CFG.sound) return;
+    initAudio();
+    if (!actx) return;
+    if (actx.state === 'suspended') actx.resume();
+
+    const now = actx.currentTime;
+    const length = Math.round(actx.sampleRate * 0.18);
+    const buffer = actx.createBuffer(1, length, actx.sampleRate);
+    const samples = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      samples[i] = (Math.random() * 2 - 1) * Math.exp(-i / (actx.sampleRate * 0.055));
+    }
+    const noise = actx.createBufferSource();
+    const filter = actx.createBiquadFilter();
+    const noiseGain = actx.createGain();
+    filter.type = 'bandpass';
+    filter.frequency.value = 1400;
+    filter.Q.value = 0.7;
+    noiseGain.gain.setValueAtTime(CFG.gunVolume * 0.45, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+    noise.buffer = buffer;
+    noise.connect(filter);
+    filter.connect(noiseGain);
+    noiseGain.connect(actx.destination);
+    noise.start(now);
+
+    const pop = actx.createOscillator();
+    const popGain = actx.createGain();
+    pop.type = 'sine';
+    pop.frequency.setValueAtTime(125, now);
+    pop.frequency.exponentialRampToValueAtTime(55, now + 0.11);
+    popGain.gain.setValueAtTime(CFG.gunVolume * 0.3, now);
+    popGain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+    pop.connect(popGain);
+    popGain.connect(actx.destination);
+    pop.start(now);
+    pop.stop(now + 0.13);
+  }
+
+  function missileSound() {
+    if (!CFG.sound) return;
+    initAudio();
+    if (!actx) return;
+    if (actx.state === 'suspended') actx.resume();
+
+    const now = actx.currentTime;
+    const oscillator = actx.createOscillator();
+    const gain = actx.createGain();
+    oscillator.type = 'sawtooth';
+    oscillator.frequency.setValueAtTime(95, now);
+    oscillator.frequency.exponentialRampToValueAtTime(520, now + 0.35);
+    gain.gain.setValueAtTime(CFG.gunVolume * 0.35, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+    oscillator.connect(gain);
+    gain.connect(actx.destination);
+    oscillator.start(now);
+    oscillator.stop(now + 0.42);
+  }
+
+  function launchMissile() {
+    initAudio();
+    const weapon = WEAPONS[weaponIndex];
+    if (!MISSILE_LIMITS[weapon]) return;
+    if (missileAmmo[weapon] <= 0) {
+      dryClick();
+      toast = { text: weapon + ': NO AMMO', until: performance.now() + 1500 };
+      return;
+    }
+    if (!ready() || !enabled || !isF16() || !inCockpit()) return;
+
+    currentTargets = getRadarTargets();
+    const selectedTarget = currentTargets.find(target =>
+      target.id === selectedTargetId && target.id === lockedTargetId);
+    if (!selectedTarget) {
+      toast = {
+        text: 'MISSILE LAUNCH BLOCKED: SELECT AND LOCK A TARGET (ENTER)',
+        until: performance.now() + 2500,
+      };
+      return;
+    }
+    const lla = geofs.aircraft.instance.llaLocation;
+    if (!lla) return;
+    const axes = bodyAxes();
+    const now = performance.now();
+    const origin = Cesium.Transforms.eastNorthUpToFixedFrame(
+      Cesium.Cartesian3.fromDegrees(lla[1], lla[0], lla[2]));
+    const start = mul(axes[0], 7);
+    const velocity = add(vel, mul(axes[0], 850));
+    const missile = {
+      enuMat: origin,
+      invEnuMat: Cesium.Matrix4.inverseTransformation(origin, new Cesium.Matrix4()),
+      t0: now,
+      updatedAt: now,
+      maxFlightTime: selectedTarget ? Math.max(8, selectedTarget.rangeNm * 1852 / 700 + 10) : 8,
+      v0: velocity,
+      start,
+      position: start.slice(),
+      velocity: velocity.slice(),
+      trail: [],
+      targetId: selectedTarget ? selectedTarget.id : null,
+      npcCountermeasureSequence,
+      weapon,
+      networkId: selectedTarget && !selectedTarget.isNpc
+        ? Date.now().toString(36) + '-' + (++networkMissileSequence).toString(36)
+        : null,
+    };
+    missiles.push(missile);
+    let networkSyncStatus = '';
+    if (selectedTarget && !selectedTarget.isNpc && missile.networkId) {
+      if (!multiplayerSync.enabled) {
+        networkSyncStatus = 'MP SYNC OFF';
+      } else if (!multiplayerSync.group) {
+        networkSyncStatus = 'MP GROUP MISSING';
+      } else {
+        const event = [
+          3,
+          'L',
+          missile.networkId,
+          selectedTarget.id,
+          Date.now(),
+        ];
+        networkSyncStatus = 'MP EVENT SENDING';
+        void sendMultiplayerSyncEvent(event).then(sent => {
+          if (sent) {
+            toast = { text: 'MISSILE EVENT SENT IN PUBLIC CHAT', until: performance.now() + 2500 };
+          }
+        });
+      }
+    }
+    missileAmmo[weapon]--;
+    missileSound();
+    toast = {
+      text: (selectedTarget ? weapon + ' LAUNCHED: ' + selectedTarget.callsign : weapon + ' LAUNCHED')
+        + (networkSyncStatus ? ' | ' + networkSyncStatus : ''),
+      until: now + 1500,
+    };
+  }
+
+  function switchWeapon(step) {
+    weaponIndex = (weaponIndex + step + WEAPONS.length) % WEAPONS.length;
+    firing = false;
+    gunSound(false);
+    toast = { text: 'WEAPON: ' + WEAPONS[weaponIndex], until: performance.now() + 1500 };
+  }
+
+  function createCanvas() {
+    canvas = document.createElement('canvas');
+    Object.assign(canvas.style, {
+      position: 'fixed', left: '0', top: '0', width: '100vw', height: '100vh',
+      pointerEvents: 'none', zIndex: '9',
+    });
+    document.body.appendChild(canvas);
+    ctx = canvas.getContext('2d');
+    const resize = () => {
+      dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(innerWidth * dpr);
+      canvas.height = Math.round(innerHeight * dpr);
+    };
+    resize();
+    addEventListener('resize', resize);
+  }
+
+  function polyline(pts) {
+    if (pts.length < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
+
+  function frame() {
+    requestAnimationFrame(frame);
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    if (!ready()) return;
+
+    const axes = bodyAxes();
+    updateMotion(axes);
+
+    if (performance.now() < toast.until) {
+      ctx.fillStyle = CFG.color;
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(toast.text, innerWidth / 2, 80);
+    }
+    const scene = geofs.api.viewer.scene;
+    const nowMs = performance.now();
+    const fdt = Math.min(0.1, Math.max(0, (nowMs - lastFrame) / 1000));
+    lastFrame = nowMs;
+    applyGForceFilter(scene);
+    drawCountermeasures(scene);
+    drawAANpcFlares(scene, nowMs);
+
+    if (geofs.aircraft.instance !== lastInst) {
+      lastInst = geofs.aircraft.instance;
+      ammo = CFG.ammo;
+      missileAmmo = { ...configuredMissiles };
+      missiles = [];
+      npcMissiles = [];
+      gLoad = 1;
+      gLoadTime = 0;
+      gPassedOut = false;
+      gRecoveryRemaining = 0;
+      lastMeasuredVelocity = null;
+      lastPos = null;
+      lastT = 0;
+      selectedTargetId = null;
+      lockedTargetId = null;
+      if (aaSimulation.active) {
+        aaSimulation.active = false;
+        aaSimulation.npcs = [];
+        npcCountermeasures = [];
+        renderGeoFsOptionsCombat();
+      }
+    }
+    updateAASimulation(nowMs, fdt);
+    currentTargets = targetMode || aaSimulation.active || missiles.some(missile => missile.targetId)
+      ? getRadarTargets()
+      : [];
+    updateAndDrawNpcMissiles(scene, nowMs);
+    updateAndDrawNetworkMissiles(scene, nowMs);
+
+    if (!enabled || !isF16() || !inCockpit()) {
+      tracers = []; missiles = []; impacts = []; gunSound(false);
+      drawGForceOverlay();
+      return;
+    }
+
+    const camPos = scene.camera.positionWC;
+    const enuMat = Cesium.Transforms.eastNorthUpToFixedFrame(camPos);
+    const fovy = (scene.camera.frustum && scene.camera.frustum.fovy) || 1;
+    const pxPerRad = (scene.canvas.clientHeight / 2) / Math.tan(fovy / 2);
+    const maskY = innerHeight * CFG.maskBottom;
+    const ang = (d) => pxPerRad * Math.tan(d * deg);   
+    const lw = Math.max(1, ang(CFG.lineDeg));
+
+  
+    if (selectedTargetId && !currentTargets.some(target => target.id === selectedTargetId)) {
+      selectedTargetId = null;
+    }
+    if (lockedTargetId && !currentTargets.some(target => target.id === lockedTargetId)) {
+      lockedTargetId = null;
+      toast = { text: 'RADAR: TARGET LOST', until: nowMs + 1500 };
+    }
+    if (targetMode && !selectedTargetId && currentTargets.length) {
+      selectedTargetId = currentTargets[0].id;
+    }
+    if (weaponIndex === 0 && firing && ammo > 0) {
+      fireAcc += CFG.fireRate * fdt;
+      const n = Math.min(Math.floor(fireAcc), ammo);
+      fireAcc -= Math.floor(fireAcc);
+      ammo -= n;
+      tracerAcc += n;
+      while (CFG.tracers && tracerAcc >= CFG.tracerEvery) {
+        tracerAcc -= CFG.tracerEvery;
+        tracers.push({ enuMat: Cesium.Matrix4.clone(enuMat), t0: nowMs,
+          v0: add(vel, mul(axes[0], CFG.muzzleVelocity)) });
+      }
+    }
+
+    gunSound(weaponIndex === 0 && firing && ammo > 0);
+
+    ctx.strokeStyle = CFG.color;
+    ctx.fillStyle = CFG.color;
+    ctx.lineWidth = lw;
+    ctx.shadowColor = CFG.color;
+    ctx.shadowBlur = 3;
+
+    const missileOffsets = (missile, t) => {
+      const f = (1 - Math.exp(-0.03 * t)) / 0.03;
+      return add(missile.start, add(mul(missile.v0, f), [0, 0, -0.75 * t * t]));
+    };
+    const liveMissiles = [];
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, innerWidth, maskY);
+    ctx.clip();
+    for (const missile of missiles) {
+      const t = (nowMs - missile.t0) / 1000;
+      if (t > missile.maxFlightTime) {
+        if (missile.networkId && !missile.networkTerminalSent) {
+          missile.networkTerminalSent = true;
+          void sendMultiplayerSyncEvent([
+            1,
+            'X',
+            missile.networkId,
+            missile.targetId,
+            Date.now(),
+          ]);
+        }
+        continue;
+      }
+      const target = missile.targetId &&
+        currentTargets.find(contact => contact.id === missile.targetId);
+      let position;
+      if (target) {
+        if (target.isNpc && missile.npcDecoy
+          && nowMs - missile.npcDecoy.t0 >= missile.npcDecoy.life) {
+          impacts.push({ pos: aaNpcFlareWorldPosition(missile.npcDecoy, nowMs), t0: nowMs });
+          toast = { text: 'PLAYER MISSILE SPOOFED BY BANDIT FLARE', until: nowMs + 2000 };
+          continue;
+        }
+        if (target.isNpc && !missile.npcDecoy) {
+          const newFlares = npcCountermeasures.filter(flare =>
+            flare.ownerId === target.id
+            && flare.sequence > (missile.npcCountermeasureSequence ?? 0)
+            && nowMs - flare.t0 < flare.life);
+          if (newFlares.length) {
+            missile.npcCountermeasureSequence = Math.max(...newFlares.map(flare => flare.sequence));
+            const difficulty = AA_DIFFICULTY_SETTINGS[target.difficulty - 1];
+            if (Math.random() < difficulty.flareChance) missile.npcDecoy = newFlares[0];
+          }
+        }
+        const targetWorld = target.isNpc && missile.npcDecoy
+          ? aaNpcFlareWorldPosition(missile.npcDecoy, nowMs)
+          : Cesium.Cartesian3.fromDegrees(target.lon, target.lat, target.alt);
+        const targetLocal = Cesium.Matrix4.multiplyByPoint(
+          missile.invEnuMat, targetWorld, new Cesium.Cartesian3());
+        const delta = [targetLocal.x - missile.position[0],
+          targetLocal.y - missile.position[1], targetLocal.z - missile.position[2]];
+        const distance = Math.hypot(delta[0], delta[1], delta[2]);
+        const dt = Math.min(0.1, Math.max(0, (nowMs - missile.updatedAt) / 1000));
+        const speed = 900;
+        if (distance <= speed * dt + 15) {
+          const impactPosition = worldPosition(missile.enuMat,
+            [targetLocal.x, targetLocal.y, targetLocal.z]);
+          if (target.isNpc && missile.npcDecoy) {
+            toast = { text: 'PLAYER MISSILE DECOYED BY BANDIT FLARE', until: nowMs + 2000 };
+          } else if (target.isNpc) {
+            damageAANpcAtWorldPosition(impactPosition, 3, 'MISSILE');
+          } else if (missile.networkId && !missile.networkHitSent) {
+            missile.networkHitSent = true;
+            missile.networkTerminalSent = true;
+            void sendMultiplayerSyncEvent([
+              1,
+              'H',
+              missile.networkId,
+              target.id,
+              Date.now(),
+            ]);
+          }
+          impacts.push({ pos: impactPosition, t0: nowMs });
+          continue;
+        }
+        if (distance > 0) {
+          missile.velocity = turnVelocity(missile.velocity, delta, 1.2 * dt);
+          const velocityLength = Math.hypot(...missile.velocity) || 1;
+          missile.velocity = mul(missile.velocity, speed / velocityLength);
+          missile.position = add(missile.position, mul(missile.velocity, dt));
+          missile.updatedAt = nowMs;
+        }
+        position = missile.position;
+      } else {
+        position = missileOffsets(missile, t);
+      }
+      const world = worldPosition(missile.enuMat, position);
+      let hit = false;
+      if (scene.globe && scene.globe.getHeight) {
+        const cartographic = Cesium.Cartographic.fromCartesian(world);
+        if (cartographic) {
+          const height = scene.globe.getHeight(cartographic);
+          if (height !== undefined && cartographic.height <= height) hit = true;
+        }
+      }
+      if (hit) {
+        if (missile.networkId && !missile.networkTerminalSent) {
+          missile.networkTerminalSent = true;
+          void sendMultiplayerSyncEvent([
+            1,
+            'X',
+            missile.networkId,
+            missile.targetId,
+            Date.now(),
+          ]);
+        }
+        impacts.push({ pos: world, t0: nowMs });
+        continue;
+      }
+      liveMissiles.push(missile);
+
+      const lastTrailPoint = missile.trail[missile.trail.length - 1];
+      if (!lastTrailPoint || Math.hypot(
+        position[0] - lastTrailPoint.position[0],
+        position[1] - lastTrailPoint.position[1],
+        position[2] - lastTrailPoint.position[2]) >= 5 ||
+        nowMs - lastTrailPoint.t0 >= 75) {
+        missile.trail.push({ position: position.slice(), t0: nowMs });
+      }
+      missile.trail = missile.trail.filter(point => nowMs - point.t0 < 1400);
+
+      ctx.save();
+      ctx.strokeStyle = '#ffffff';
+      ctx.shadowColor = '#ffffff';
+      for (let i = 1; i < missile.trail.length; i++) {
+        const previousPoint = missile.trail[i - 1];
+        const currentPoint = missile.trail[i];
+        const age = nowMs - currentPoint.t0;
+        const fade = Math.max(0, 1 - age / 1400);
+        const previousScreen = toScreen(missile.enuMat, scene, previousPoint.position, true);
+        const currentScreen = toScreen(missile.enuMat, scene, currentPoint.position, true);
+        if (!previousScreen || !currentScreen) continue;
+        ctx.globalAlpha = 0.25 * fade;
+        ctx.lineWidth = 1 + 2 * fade;
+        ctx.shadowBlur = 4 * fade;
+        ctx.beginPath();
+        ctx.moveTo(previousScreen.x, previousScreen.y);
+        ctx.lineTo(currentScreen.x, currentScreen.y);
+        ctx.stroke();
+      }
+
+      const current = toScreen(missile.enuMat, scene, position, true);
+      const previous = missile.trail.length > 1
+        ? toScreen(missile.enuMat, scene, missile.trail[missile.trail.length - 2].position, true)
+        : null;
+      if (current) {
+        if (previous) {
+          const dx = current.x - previous.x, dy = current.y - previous.y;
+          const angle = Math.atan2(dy, dx);
+          ctx.globalAlpha = 0.85;
+          ctx.strokeStyle = '#ffb06a';
+          ctx.shadowColor = '#ff7a24';
+          ctx.shadowBlur = 9;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(current.x - Math.cos(angle) * 2, current.y - Math.sin(angle) * 2);
+          ctx.lineTo(current.x - Math.cos(angle) * 10, current.y - Math.sin(angle) * 10);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 5;
+        ctx.beginPath();
+        ctx.arc(current.x, current.y, 1.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    missiles = liveMissiles;
+    ctx.restore();
+  
+    if (CFG.tracers) {
+      const offs = (tr, t) => {
+        const f = (1 - Math.exp(-CFG.drag * t)) / CFG.drag;
+        return [tr.v0[0] * f, tr.v0[1] * f, tr.v0[2] * f - 0.5 * CFG.gravity * t * t];
+      };
+      const alive = [];
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, innerWidth, maskY);
+      ctx.clip();
+      ctx.strokeStyle = CFG.tracerColor;
+      ctx.shadowColor = CFG.tracerColor;
+      ctx.shadowBlur = 6;
+      ctx.lineWidth = Math.max(1.5, ang(0.15));
+      for (const tr of tracers) {
+        const t = (nowMs - tr.t0) / 1000;
+        if (t > 3) continue;
+        const pa = offs(tr, t);
+        const wa = Cesium.Matrix4.multiplyByPoint(tr.enuMat, new Cesium.Cartesian3(pa[0], pa[1], pa[2]), new Cesium.Cartesian3());
+        let hit = false;
+        if (scene.globe && scene.globe.getHeight) {
+          const c = Cesium.Cartographic.fromCartesian(wa);
+          if (c) {
+            const h = scene.globe.getHeight(c);
+            if (h !== undefined && c.height <= h) hit = true;
+          }
+        }
+        if (hit) { impacts.push({ pos: wa, t0: nowMs }); continue; }
+        if (damageAANpcAtWorldPosition(wa, 1, 'GUN')) continue;
+        alive.push(tr);
+        if (Math.hypot(pa[0], pa[1], pa[2]) < CFG.tracerMinDist) continue;
+        const a = toScreen(tr.enuMat, scene, pa, true);
+        const b = toScreen(tr.enuMat, scene, offs(tr, Math.max(0, t - 0.05)), true);
+        if (!a || !b) continue;
+        ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(a.x, a.y); ctx.stroke();
+      }
+      tracers = alive;
+
+    
+      impacts = impacts.filter(i => nowMs - i.t0 < 500);
+      const fn = Cesium.SceneTransforms.worldToWindowCoordinates || Cesium.SceneTransforms.wgs84ToWindowCoordinates;
+      const rect = scene.canvas.getBoundingClientRect();
+      for (const i of impacts) {
+        const s = fn.call(Cesium.SceneTransforms, scene, i.pos);
+        if (!s) continue;
+        const k = 1 - (nowMs - i.t0) / 500;
+        ctx.globalAlpha = k;
+        ctx.fillStyle = CFG.impactColor;
+        ctx.shadowBlur = 0;      
+        ctx.beginPath();
+        ctx.arc(rect.left + s.x, rect.top + s.y, 2 + 6 * k, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+      ctx.strokeStyle = CFG.color;
+      ctx.fillStyle = CFG.color;
+      ctx.lineWidth = lw;
+      ctx.shadowColor = CFG.color;
+      ctx.shadowBlur = 3;
+    }
+
+    const bs = toScreen(enuMat, scene, mul(axes[0], 1000));
+    if (!bs) {
+      drawAANpcHudTargets(scene);
+      drawAAMiniRadar();
+      drawGForceOverlay();
+      return;
+    }
+    const halfW = pxPerRad * Math.tan(CFG.hudFov.w / 2 * deg);
+    const halfH = pxPerRad * Math.tan(CFG.hudFov.h / 2 * deg);
+    const top = bs.y - halfH;
+    const bottom = Math.min(bs.y + halfH, maskY);
+    if (CFG.showHudFrame) {
+      ctx.save();
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bs.x - halfW, top, halfW * 2, bs.y + halfH - top);
+      ctx.strokeStyle = '#ff5050';
+      ctx.beginPath(); ctx.moveTo(0, maskY); ctx.lineTo(innerWidth, maskY); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(bs.x - halfW, top, halfW * 2, Math.max(0, bottom - top));
+    ctx.clip();
+
+    if (targetMode) {
+      drawHudTarget(scene, currentTargets.find(target => target.id === selectedTargetId), {
+        left: bs.x - halfW,
+        right: bs.x + halfW,
+        top,
+        bottom,
+      });
+    }
+
+  
+    ctx.beginPath();
+    const arm = ang(CFG.crossDeg);
+    ctx.moveTo(bs.x - arm, bs.y); ctx.lineTo(bs.x + arm, bs.y);
+    ctx.moveTo(bs.x, bs.y - arm); ctx.lineTo(bs.x, bs.y + arm);
+    ctx.stroke();
+
+    if (weaponIndex === 0) {
+      const v0 = add(vel, mul(axes[0], CFG.muzzleVelocity));
+      const pts = [];
+      for (let t = CFG.step; t <= CFG.maxTime; t += CFG.step) {
+        const f = (1 - Math.exp(-CFG.drag * t)) / CFG.drag;
+        const bullet = add(mul(v0, f), [0, 0, -0.5 * CFG.gravity * t * t]);
+        const rel = [bullet[0] - vel[0] * t, bullet[1] - vel[1] * t, bullet[2] - vel[2] * t];
+        const b0 = [dot(axes[0], rel), dot(axes[1], rel), dot(axes[2], rel)];
+        const b = inRotatedFrame(b0, t);
+        const range = Math.hypot(b[0], b[1], b[2]);
+        if (range < CFG.minRange) continue;
+        if (range > CFG.maxRange) break;
+        const dir = add(add(mul(axes[0], b[0] / range), mul(axes[1], b[1] / range)),
+          mul(axes[2], b[2] / range));
+        const screen = toScreen(enuMat, scene, mul(dir, 1000));
+        if (screen) pts.push({ x: screen.x, y: screen.y, r: range });
+      }
+
+      if (pts.length >= 3) {
+        const left = [], right = [];
+        for (let i = 0; i < pts.length; i++) {
+          const prev = pts[Math.max(0, i - 1)], next = pts[Math.min(pts.length - 1, i + 1)];
+          let tx = next.x - prev.x, ty = next.y - prev.y;
+          const len = Math.hypot(tx, ty) || 1;
+          tx /= len;
+          ty /= len;
+          const half = (CFG.wingspan / 2) / pts[i].r * pxPerRad;
+          left.push({ x: pts[i].x - ty * half, y: pts[i].y + tx * half, r: pts[i].r });
+          right.push({ x: pts[i].x + ty * half, y: pts[i].y - tx * half, r: pts[i].r });
+        }
+        polyline(left);
+        polyline(right);
+        ctx.font = Math.max(6, ang(CFG.tickTextDeg)) + 'px monospace';
+        ctx.textAlign = 'left';
+        for (const range of CFG.tickRanges) {
+          const i = left.findIndex(p => p.r >= range);
+          if (i < 0) continue;
+          ctx.beginPath();
+          ctx.moveTo(left[i].x, left[i].y);
+          ctx.lineTo(right[i].x, right[i].y);
+          ctx.stroke();
+          ctx.fillText((range / 1000).toFixed(1), right[i].x + ang(0.4), right[i].y + ang(0.3));
+        }
+      }
+    } else {
+      ctx.beginPath();
+      ctx.arc(bs.x, bs.y, ang(5), Math.PI, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.font = 'bold ' + Math.max(8, ang(CFG.counterTextDeg)) + 'px monospace';
+    ctx.textAlign = 'left';
+    const weaponLabel = WEAPONS[weaponIndex];
+    const weaponAmmo = weaponIndex === 0 ? ammo : (missileAmmo[weaponLabel] ?? 0);
+    ctx.fillStyle = weaponAmmo > 0 ? CFG.color : '#ff0000';
+    ctx.fillText(weaponAmmo > 0 ? weaponLabel + ' ' + String(weaponAmmo).padStart(3, '0') :
+      weaponLabel + ' NO AMMO', bs.x - halfW + ang(0.5), bottom - ang(0.6));
+    ctx.fillStyle = CFG.color;
+    ctx.restore();
+
+    ctx.shadowBlur = 0;
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(WEAPONS[weaponIndex] + ' [- / =]  SET LOADOUT IN GEOFS OPTIONS  T TARGET MODE  , PREV / NEXT  ENTER LOCK  RELOAD [Shift+' +
+      CFG.toggleKey.toUpperCase() + ']', 16, innerHeight - 16);
+    drawAANpcHudTargets(scene);
+    drawAAMiniRadar();
+    drawGForceOverlay();
+  }
+
+
+  addEventListener('keydown', function (e) {
+    if (typing(e)) return;
+    if (e.code === 'KeyT' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      if (e.repeat) return;
+      if (!ready()) return;
+      targetMode = !targetMode;
+      if (targetMode) {
+        currentTargets = getRadarTargets();
+        selectedTargetId = currentTargets.length ? currentTargets[0].id : null;
+      } else {
+        lockedTargetId = null;
+      }
+      toast = {
+        text: targetMode ? 'RADAR ON' : ' MODE OFF',
+        until: performance.now() + 1500,
+      };
+      return;
+    }
+    if (targetMode && (e.code === 'Comma' || e.code === 'Slash')) {
+      e.preventDefault();
+      if (!e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        selectTarget(e.code === 'Slash' ? 1 : -1);
+      }
+      return;
+    }
+    if (targetMode && e.code === 'Enter') {
+      e.preventDefault();
+      if (e.repeat || e.ctrlKey || e.altKey || e.metaKey) return;
+      if (!currentTargets.some(target => target.id === selectedTargetId)) {
+        toast = { text: 'RADAR: SELECT A TARGET FIRST', until: performance.now() + 1500 };
+      } else if (lockedTargetId === selectedTargetId) {
+        lockedTargetId = null;
+        toast = { text: 'TARGET UNLOCKED', until: performance.now() + 1500 };
+      } else {
+        lockedTargetId = selectedTargetId;
+        const target = currentTargets.find(contact => contact.id === lockedTargetId);
+        toast = { text: 'TARGET LOCKED: ' + target.callsign, until: performance.now() + 1500 };
+      }
+      return;
+    }
+    if (e.code === 'Equal' || e.code === 'Minus') {
+      e.preventDefault();
+      if (!e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        switchWeapon(e.code === 'Equal' ? 1 : -1);
+      }
+      return;
+    }
+    if (e.code === 'Backspace') {
+      e.preventDefault();
+      if (!e.repeat) releaseCountermeasures();
+      return;
+    }
+    if (e.code === CFG.fireCode) {
+      if (weaponIndex === 0) {
+        initAudio();
+        if (!e.repeat && ammo <= 0) dryClick();
+        firing = true;
+      } else if (!e.repeat) {
+        launchMissile();
+      }
+      return;
+    }
+
+
+    if (e.altKey && !e.ctrlKey && !e.metaKey) {
+      const step = e.shiftKey ? 10 : 2;
+      const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+      if (moves[e.code]) {
+        CFG.hudOffset.x += moves[e.code][0];
+        CFG.hudOffset.y += moves[e.code][1];
+      } else if (e.code === 'Digit0') {
+        CFG.hudOffset.x = 0; CFG.hudOffset.y = 0;
+      } else if (e.code === 'KeyH') {
+        CFG.showHudFrame = !CFG.showHudFrame;
+      } else return;
+      e.preventDefault();
+      try { localStorage.setItem('geofs-eegs-offset', JSON.stringify(CFG.hudOffset)); } catch (err) {}
+      toast = { text: 'HUD offset: x ' + CFG.hudOffset.x + '  y ' + CFG.hudOffset.y, until: performance.now() + 1500 };
+      return;
+    }
+
+    if (e.repeat || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.key.toLowerCase() === CFG.toggleKey) {
+      if (e.shiftKey) {
+        if (weaponIndex === 0) {
+          ammo = CFG.ammo;
+          toast = { text: 'GUN reloaded: ' + ammo, until: performance.now() + 2000 };
+        } else {
+          const weapon = WEAPONS[weaponIndex];
+          missileAmmo[weapon] = configuredMissiles[weapon];
+          toast = { text: weapon + ' reloaded: ' + missileAmmo[weapon], until: performance.now() + 2000 };
+        }
+      } else {
+        enabled = !enabled;
+        toast = { text: 'EEGS display: ' + (enabled ? 'ON' : 'OFF'), until: performance.now() + 2000 };
+      }
+    }
+  }, true);
+  addEventListener('keyup', function (e) { if (e.code === CFG.fireCode) firing = false; }, true);
+  addEventListener('blur', function () { firing = false; });
+
+  try {
+    const saved = JSON.parse(localStorage.getItem('geofs-eegs-offset'));
+    if (saved && isFinite(saved.x) && isFinite(saved.y)) CFG.hudOffset = { x: saved.x, y: saved.y };
+  } catch (err) {}
+  loadConfiguredMissiles();
+  loadAABanditHudPoiSetting();
+  loadMultiplayerSyncSettings();
+  ensureMultiplayerSyncHook();
+  setInterval(() => {
+    ensureMultiplayerSyncHook();
+  }, 1000);
+
+  const boot = setInterval(function () {
+    if (document.body) watchGeoFsOptionsLoadout();
+    ensureMultiplayerSyncHook();
+    if (document.body && ready()) {
+      clearInterval(boot);
+      createCanvas();
+      requestAnimationFrame(frame);
+      toast = { text: 'EEGS loaded (' + CFG.toggleKey.toUpperCase() + ' to toggle, have fun I guess)', until: performance.now() + 3000 };
+    }
+  }, 500);
+})();
