@@ -2,6 +2,8 @@
 (function () {
   'use strict';
 
+  if (window.top !== window.self) return;
+
   const CFG = {
     toggleKey: 'u',          // shift+U = reload gun
     startEnabled: true,
@@ -20,6 +22,21 @@
     hudFov: { w: 18, h: 20 },   
     hudOffset: { x: 0, y: 0 },  
     showHudFrame: false,        
+    cockpitBrowser: {
+      url: 'https://www.geo-fs.com/geofs.php?v=3.9',
+      viewportWidth: 720,
+      viewportHeight: 520,
+      forwardDistance: 1000,
+      centerRightDeg: 15,
+      centerDownDeg: 30,
+      widthDeg: 12,
+      heightDeg: 9,
+      toggleCode: 'F8',
+    },
+    cockpitBrowserSecondary: {
+      url: 'https://www.geo-fs.com/pages/map.php',
+      centerRightDeg: -15,
+    },
     maskBottom: 0.62,           
     ammo: 510,
     fireRate: 100,
@@ -44,6 +61,9 @@
   const deg = Math.PI / 180;
   const R_EARTH = 6378137;
   const RADAR_RANGE_NM = 70;
+  const BROWSER_PANEL_WIDTH = 320;
+  const BROWSER_PANEL_HEIGHT = 240;
+  const BROWSER_PANEL_BORDER = 8;
   const LOADOUT_STORAGE_KEY = 'geofs-eegs-loadout';
   const AA_HUD_POI_STORAGE_KEY = 'geofs-eegs-aa-hud-poi';
   const MP_SYNC_STORAGE_KEY = 'geofs-eegs-mp-sync';
@@ -70,6 +90,7 @@
   let enabled = CFG.startEnabled;
   let toast = { text: '', until: 0 };
   let canvas, ctx, dpr = 1, optionsLoadoutObserver = null;
+  let browserPanels = [], browserVisible = true;
   let ammo = CFG.ammo, firing = false, fireAcc = 0, tracerAcc = 0, lastFrame = 0, lastInst = null;
   let configuredMissiles = { ...DEFAULT_MISSILE_LOADOUT };
   let missileAmmo = { ...DEFAULT_MISSILE_LOADOUT };
@@ -2262,6 +2283,182 @@
     toast = { text: 'WEAPON: ' + WEAPONS[weaponIndex], until: performance.now() + 1500 };
   }
 
+  function createCockpitBrowser() {
+    if (browserPanels.length) return;
+
+    const viewportWidth = CFG.cockpitBrowser.viewportWidth;
+    const viewportHeight = CFG.cockpitBrowser.viewportHeight;
+    const contentWidth = BROWSER_PANEL_WIDTH - BROWSER_PANEL_BORDER * 2;
+    const contentHeight = BROWSER_PANEL_HEIGHT - BROWSER_PANEL_BORDER * 2;
+    const iframeScale = Math.min(contentWidth / viewportWidth, contentHeight / viewportHeight);
+    const iframeTop = (contentHeight - viewportHeight * iframeScale) / 2;
+    const browserConfigs = [
+      CFG.cockpitBrowser,
+      { ...CFG.cockpitBrowser, ...CFG.cockpitBrowserSecondary },
+    ];
+
+    browserPanels = browserConfigs.map((browserConfig, index) => {
+      const panel = document.createElement('div');
+      Object.assign(panel.style, {
+        position: 'fixed',
+        left: '0',
+        top: '0',
+        width: BROWSER_PANEL_WIDTH + 'px',
+        height: BROWSER_PANEL_HEIGHT + 'px',
+        boxSizing: 'border-box',
+        overflow: 'hidden',
+        border: BROWSER_PANEL_BORDER + 'px solid #22282a',
+        borderRadius: '5px',
+        background: '#050708',
+        boxShadow: '0 0 0 2px #090b0c, inset 0 0 12px #000, 0 0 18px #000',
+        transformOrigin: '0 0',
+        zIndex: String(20 + index),
+        display: 'none',
+        pointerEvents: 'auto',
+      });
+
+      const frame = document.createElement('iframe');
+      frame.title = index === 0 ? 'GeoFS cockpit browser' : 'Secondary cockpit browser';
+      frame.src = 'about:blank';
+      Object.assign(frame.style, {
+        display: 'block',
+        position: 'absolute',
+        left: '0',
+        top: iframeTop + 'px',
+        width: viewportWidth + 'px',
+        height: viewportHeight + 'px',
+        border: '0',
+        background: '#050708',
+        transform: 'scale(' + iframeScale + ')',
+        transformOrigin: 'top left',
+      });
+
+      const closeButton = document.createElement('button');
+      closeButton.type = 'button';
+      closeButton.textContent = 'X';
+      closeButton.setAttribute('aria-label', 'Hide cockpit browsers');
+      Object.assign(closeButton.style, {
+        position: 'absolute',
+        top: '1px',
+        right: '1px',
+        zIndex: '1',
+        width: '19px',
+        height: '19px',
+        padding: '0',
+        border: '1px solid #687174',
+        borderRadius: '3px',
+        background: '#111719',
+        color: '#d8e4e6',
+        font: 'bold 14px monospace',
+        lineHeight: '16px',
+        cursor: 'pointer',
+      });
+      closeButton.addEventListener('click', function () {
+        browserVisible = false;
+        browserPanels.forEach(browser => { browser.panel.style.display = 'none'; });
+      });
+
+      panel.append(frame, closeButton);
+      document.body.appendChild(panel);
+      return { panel, frame, config: browserConfig };
+    });
+  }
+
+  function browserQuadTransform(points, width, height) {
+    const [p0, p1, p2, p3] = points;
+    const area = (p1.x - p0.x) * (p3.y - p0.y) - (p1.y - p0.y) * (p3.x - p0.x);
+    if (Math.abs(area) < 1e-7) return null;
+    const dx1 = p1.x - p2.x;
+    const dx2 = p3.x - p2.x;
+    const dx3 = p0.x - p1.x + p2.x - p3.x;
+    const dy1 = p1.y - p2.y;
+    const dy2 = p3.y - p2.y;
+    const dy3 = p0.y - p1.y + p2.y - p3.y;
+    let g = 0;
+    let h = 0;
+
+    if (Math.abs(dx3) + Math.abs(dy3) > 1e-7) {
+      const determinant = dx1 * dy2 - dx2 * dy1;
+      if (Math.abs(determinant) < 1e-7) return null;
+      g = (dx3 * dy2 - dx2 * dy3) / determinant;
+      h = (dx1 * dy3 - dx3 * dy1) / determinant;
+    }
+
+    const a = p1.x - p0.x + g * p1.x;
+    const b = p3.x - p0.x + h * p3.x;
+    const c = p0.x;
+    const d = p1.y - p0.y + g * p1.y;
+    const e = p3.y - p0.y + h * p3.y;
+    const f = p0.y;
+    const values = [
+      a / width, d / width, 0, g / width,
+      b / height, e / height, 0, h / height,
+      0, 0, 1, 0,
+      c, f, 0, 1,
+    ];
+    if (!values.every(Number.isFinite)) return null;
+    return 'matrix3d(' + values.join(',') + ')';
+  }
+
+  // Uses the same camera-origin aircraft-axis projection as the HUD.
+  function updateCockpitBrowser(scene, axes) {
+    createCockpitBrowser();
+    if (!browserVisible || !isF16() || !inCockpit()) {
+      browserPanels.forEach(browser => { browser.panel.style.display = 'none'; });
+      return;
+    }
+
+    const camera = scene.camera;
+    if (!camera.positionWC) {
+      browserPanels.forEach(browser => { browser.panel.style.display = 'none'; });
+      return;
+    }
+
+    const cameraFrame = Cesium.Transforms.eastNorthUpToFixedFrame(camera.positionWC);
+    browserPanels.forEach(browser => {
+      const { panel, frame, config } = browser;
+      if (frame.src === 'about:blank') frame.src = config.url;
+
+      const distance = config.forwardDistance;
+      const halfWidth = config.widthDeg / 2;
+      const halfHeight = config.heightDeg / 2;
+      const horizontalAngles = [
+        config.centerRightDeg - halfWidth,
+        config.centerRightDeg + halfWidth,
+      ];
+      const verticalAngles = [
+        config.centerDownDeg - halfHeight,
+        config.centerDownDeg + halfHeight,
+      ];
+      const localCorners = [
+        [horizontalAngles[0], verticalAngles[0]],
+        [horizontalAngles[1], verticalAngles[0]],
+        [horizontalAngles[1], verticalAngles[1]],
+        [horizontalAngles[0], verticalAngles[1]],
+      ].map(([rightDeg, downDeg]) => add(
+        mul(axes[0], distance),
+        add(
+          mul(axes[1], distance * Math.tan(rightDeg * deg)),
+          mul(axes[2], distance * Math.tan(downDeg * deg))
+        )
+      ));
+      const points = localCorners.map(point => toScreen(
+        cameraFrame, scene, point, true));
+      if (points.some(point => !point || !Number.isFinite(point.x) || !Number.isFinite(point.y))) {
+        panel.style.display = 'none';
+        return;
+      }
+
+      const transform = browserQuadTransform(points, BROWSER_PANEL_WIDTH, BROWSER_PANEL_HEIGHT);
+      if (!transform) {
+        panel.style.display = 'none';
+        return;
+      }
+      panel.style.transform = transform;
+      panel.style.display = 'block';
+    });
+  }
+
   function createCanvas() {
     canvas = document.createElement('canvas');
     Object.assign(canvas.style, {
@@ -2270,6 +2467,7 @@
     });
     document.body.appendChild(canvas);
     ctx = canvas.getContext('2d');
+    createCockpitBrowser();
     const resize = () => {
       dpr = window.devicePixelRatio || 1;
       canvas.width = Math.round(innerWidth * dpr);
@@ -2304,6 +2502,7 @@
       ctx.fillText(toast.text, innerWidth / 2, 80);
     }
     const scene = geofs.api.viewer.scene;
+    updateCockpitBrowser(scene, axes);
     const nowMs = performance.now();
     const fdt = Math.min(0.1, Math.max(0, (nowMs - lastFrame) / 1000));
     lastFrame = nowMs;
@@ -2734,6 +2933,20 @@
 
   addEventListener('keydown', function (e) {
     if (typing(e)) return;
+    if (e.code === CFG.cockpitBrowser.toggleCode && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      if (!e.repeat) {
+        browserVisible = !browserVisible;
+        if (!browserVisible) {
+          browserPanels.forEach(browser => { browser.panel.style.display = 'none'; });
+        }
+        toast = {
+          text: 'COCKPIT BROWSER: ' + (browserVisible ? 'ON' : 'OFF'),
+          until: performance.now() + 1500,
+        };
+      }
+      return;
+    }
     if (e.code === 'KeyT' && !e.ctrlKey && !e.altKey && !e.metaKey) {
       e.preventDefault();
       if (e.repeat) return;
@@ -2746,7 +2959,7 @@
         lockedTargetId = null;
       }
       toast = {
-        text: targetMode ? 'RADAR ON' : ' MODE OFF',
+        text: targetMode ? 'TARGET MODE ON' : 'TARGET MODE OFF',
         until: performance.now() + 1500,
       };
       return;
